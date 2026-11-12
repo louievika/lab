@@ -1,0 +1,11 @@
+{
+  "name": "bigdad",
+  "displayName": "Big Dad",
+  "version": "2.0.7",
+  "description": "Big Dad brings home the milk: finds the tokens Claude Code keeps re-sending, keeps reads hot, and proves every cut.",
+  "author": {
+    "name": "LouieVika"
+  },
+  "license": "MIT",
+  "keywords": ["tokens", "context", "audit", "claude-code", "agent-skills", "hooks"]
+}

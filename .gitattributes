@@ -1,0 +1,2 @@
+# Hook launchers must keep LF line endings on every checkout (sh on Linux/WSL breaks on CRLF).
+*.sh text eol=lf

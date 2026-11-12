@@ -1,0 +1,17 @@
+{
+  "name": "lab",
+  "owner": {
+    "name": "LouieVika"
+  },
+  "metadata": {
+    "description": "Louie Vika's lab: experiments and prototypes."
+  },
+  "plugins": [
+    {
+      "name": "bigdad",
+      "source": "./bigdad",
+      "version": "2.0.7",
+      "description": "Big Dad brings home the milk: finds the tokens Claude Code keeps re-sending, keeps reads hot, and proves every cut."
+    }
+  ]
+}
