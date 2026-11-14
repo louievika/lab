@@ -32,6 +32,8 @@ permission rules see and has broken exit codes and Windows quoting for them. Big
     sits where the middle was and names the full copy. File reads are exempt (every part of the command starts
     with cat/head/tail/sed/grep/rg/awk/Get-Content..., or git show REV:PATH): the model asked for that text.
     So is output already cut by a final `| tail -N` / `| head -N` (N up to 200): the caller chose that cut.
+    2.0.9: only when that pipeline is all that prints (cd/export aside) and the real output agrees: no more
+    lines than N, normal-width lines (400 chars on average, none over 4,000). Else the cap applies.
   - Any internal error: no output, so Claude sees the original.
 
   BIGDAD_SHRINK=off          turn it off (or `bigdad.py shrink off`, which writes ~/.claude/bigdad/shrink)
@@ -363,28 +365,241 @@ def is_file_read(cmd):
 
 
 TRIM_MAX = 200     # a final `| tail -N` / `| head -N` up to this many lines is the caller's own cut: the cap leaves it
+# 2.0.9: ...only when the real output agrees. A line count does not bound size (`curl | head -1` is one line of any
+# length), so the lines must also be normal width. How the bounds were chosen: the case 2.0.8 is for is a
+# `| tail -200` of log, test or build lines, which run 80-200 chars (the 2.0.8 test's are ~150). LINE_CAP (400) is
+# where the family shrink already calls a line over-long, so an average up to 400 leaves every such tail whole:
+# 200 x 400 = 80k, past the ~30k Claude Code keeps inline, so no normal tail that reaches this hook is cut by it.
+# One line over CAP_CHARS (4,000) is more than the whole cap shows: minified JS/JSON or a blob, not a line the
+# caller sized, so it is cut whatever the average.
+TRIM_LINE_AVG = LINE_CAP
+TRIM_LINE_MAX = CAP_CHARS
+TRIM_CMD_MAX = 4_000   # longer commands are not parsed for a trim (the cap applies as to any other command)
+SILENT = {"cd", "export", "unset", "true", ":", "set", "set-location", "sl", "setlocal", "shopt", "mkdir", "umask",
+          "ulimit"}    # parts that print nothing, so they may sit next to the trimmed pipeline (cd a && x | tail -5)
+NEEDS_ARG = {"export", "set", "shopt", "umask", "ulimit"}    # ...but with no argument (or -p, -o, -a, -S) a table
+TRIM_LONG = ("lines", "bytes", "quiet", "silent", "verbose", "follow", "retry", "pid", "sleep-interval",
+             "max-unchanged-stats", "zero-terminated", "help", "version")   # head/tail long options (GNU)
+
+
+def _split_top(cmd):
+    """The top level of a shell command as [(part, op)], op being the operator after the part: '|' (also |&),
+    ';' (also a newline), '&&', '||', '&' or '' at the end. Quotes, backslash escapes, comments, $(...), `...`,
+    ( ) and { } groups stay inside their part. None when it is not plain enough to read: a heredoc, a case `;;`,
+    an unclosed quote or bracket."""
+    out, buf, stack, q, i, n = [], [], [], None, 0, len(cmd)
+
+    def word_start():
+        return not buf or buf[-1] in " \t\n;&|("
+
+    while i < n:
+        c = cmd[i]
+        if q:                                          # inside quotes: only the closing quote (and \ in "..") counts
+            buf.append(c)
+            if c == "\\" and q != "'" and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 1
+            elif c == q:
+                q = None
+            i += 1
+            continue
+        if c == "\\":
+            buf.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"`":
+            q = c
+        elif c == "#" and word_start():                # a comment, to the end of its line
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif cmd.startswith("<<", i):
+            return None                                # a heredoc: its body would read as commands
+        elif c == "{" and i and cmd[i - 1] == "$":
+            stack.append("}$")                         # ${VAR}
+        elif c == "{" and word_start() and (i + 1 >= n or cmd[i + 1] in " \t\n"):
+            stack.append("}")                          # { a; b; }
+        elif c == "(":
+            stack.append(")")                          # ( a; b ), $(...), <(...)
+        elif c == ")":
+            if not stack or stack[-1] != ")":
+                return None
+            stack.pop()
+        elif c == "}" and stack and (stack[-1] == "}$" or (stack[-1] == "}" and word_start())):
+            stack.pop()
+        elif not stack and c in ";&|\n":
+            two = cmd[i:i + 2]
+            if two == ";;":
+                return None
+            if c == "&" and buf and buf[-1] in "<>" or two == "&>":
+                buf.append(c)                          # 2>&1, >&2, &>file: a redirect, not an operator
+                i += 1
+                continue
+            op, step = {"&&": ("&&", 2), "||": ("||", 2), "|&": ("|", 2)}.get(two, (None, 1))
+            op = op or {"|": "|", "&": "&"}.get(c, ";")
+            out.append(("".join(buf).strip(), op))
+            buf = []
+            i += step
+            continue
+        buf.append(c)
+        i += 1
+    if q or stack:
+        return None
+    out.append(("".join(buf).strip(), ""))
+    return out
+
+
+def _silent(part):
+    """A part that prints nothing to stdout: empty, VAR=value only, or cd/export/set... with what they need."""
+    toks = [_unq(w) for w in _toks(part)]
+    while toks and re.match(r"^[A-Za-z_]\w*=", toks[0]):
+        toks = toks[1:]
+    if not toks:
+        return True
+    head, args = _bare(toks[0]), toks[1:]
+    if head not in SILENT:
+        return False
+    if head in ("cd", "set-location", "sl") and "-" in args:
+        return False                                   # cd - prints the folder
+    if head in NEEDS_ARG and (not args or args in (["-p"], ["-o"], ["+o"], ["-a"], ["-S"])):
+        return False                                   # export / set -o / ulimit -a ...: a table
+    return not (head == "mkdir" and any(re.match(r"^(-[a-z]*v|--verbose)", a) for a in args))
+
+
+def _group_inner(part):
+    """The inside of a part that is one ( ... ) or { ...; } group (stderr redirects after it allowed), or None."""
+    p = part.strip()
+    while True:
+        m = re.search(r"\s+2>\s*(&1|/dev/null|\$null|nul)$", p, re.I)
+        if not m:
+            break
+        p = p[:m.start()]
+    if len(p) >= 2 and p[0] == "(" and p[-1] == ")":
+        inner = p[1:-1]
+    elif len(p) >= 3 and p[0] == "{" and p[1] in " \t\n" and p[-1] == "}":
+        inner = p[1:-1]
+    else:
+        return None
+    return inner if _split_top(inner) is not None else None
+
+
+def _count(v):
+    """A head/tail line count the caller sized: plain digits. -K (all but the last K), +K (from line K on),
+    5K/1M multipliers or anything else: None."""
+    return int(v) if isinstance(v, str) and re.fullmatch(r"\d{1,9}", v) else None
+
+
+def _cut_count(stage):
+    """Lines a `head`/`tail` stage reading stdin lets through, or None when it is not a small line cut: bytes
+    (-c), follow (-f/-F), -n -K, +K, -r, -z, a file operand, a stdout redirect, --help, an unknown option."""
+    toks = [_unq(w) for w in _toks(stage)]
+    if not toks or _bare(toks[0]) not in ("head", "tail"):
+        return None
+    n, extra, args, i, done = 10, 0, toks[1:], 0, False
+    while i < len(args):
+        w = args[i]
+        i += 1
+        if re.match(r"^2>(&1|/dev/null|\$null|nul)?$", w, re.I):
+            i += w == "2>"                             # stderr only: 2>&1, 2>/dev/null, 2> file
+            continue
+        if ">" in w or "<" in w:
+            return None                                # stdout sent elsewhere, or input from a file
+        if done or w == "-" or not w.startswith("-"):
+            if w == "-":
+                continue                               # `-` is stdin
+            return None                                # a file operand (or tail's +K): not the pipe's cut
+        if w == "--":
+            done = True
+        elif w.startswith("--"):
+            name, eq, val = w[2:].partition("=")
+            hits = [o for o in TRIM_LONG if o == name] or [o for o in TRIM_LONG if o.startswith(name)]
+            if len(hits) != 1:
+                return None
+            if hits[0] == "lines":
+                if not eq:
+                    val = args[i] if i < len(args) else None
+                    i += 1
+                n = _count(val)
+                if n is None:
+                    return None
+            elif hits[0] in ("quiet", "silent", "verbose"):
+                extra = int(hits[0] == "verbose")      # -v prints a `==> standard input <==` line first
+            else:
+                return None                            # bytes, follow, retry, pid, zero-terminated, help...
+        elif w[1].isdigit():                           # obsolete -5, -5q, tail -5l
+            m = re.fullmatch(r"-(\d{1,9})([lqv]*)", w)
+            if not m:
+                return None                            # -5c (bytes), -5f (follow), -5k...
+            n = int(m.group(1))
+            extra = int("v" in m.group(2)) if re.search("[qv]", m.group(2)) else extra
+        else:
+            for k, ch in enumerate(w[1:], 1):
+                if ch == "n":
+                    val = w[k + 1:]
+                    if not val:
+                        val = args[i] if i < len(args) else None
+                        i += 1
+                    n = _count(val)
+                    if n is None:
+                        return None
+                    break
+                if ch in "qv":
+                    extra = int(ch == "v")
+                else:
+                    return None                        # -c, -f, -F, -r, -z, -s...
+    return n + extra if n <= TRIM_MAX else None
+
+
+def trim_lines(cmd, _depth=0):
+    """How many lines the command's own head/tail trim lets through, when that trim bounds everything it prints;
+    else None. The command must be one pipeline ending in `| head -N` / `| tail -N` (N up to TRIM_MAX; none
+    given: 10), next to nothing but silent parts (cd, export...). A ( ) or { } group in front of the trim is
+    covered by it; a whole command in a group is read inside. This reads the text only: trim_fits checks it."""
+    if not isinstance(cmd, str) or len(cmd) > TRIM_CMD_MAX or "|" not in cmd:
+        return None
+    parts = _split_top(cmd)
+    if not parts:
+        return None
+    found, stages = None, []
+    for part, op in parts:
+        stages.append(part)
+        if op == "|":
+            continue
+        if op == "&":
+            return None                                # a background part prints when it likes
+        if len(stages) == 1 and _silent(stages[0]):
+            stages = []
+            continue
+        if found is not None or not all(stages):
+            return None                                # a second part that prints, or an empty stage
+        if len(stages) > 1:
+            n = _cut_count(stages[-1])
+        else:
+            inner = _group_inner(stages[0])
+            n = trim_lines(inner, _depth + 1) if inner is not None and _depth < 4 else None
+        if n is None:
+            return None
+        found, stages = n, []
+    return found
 
 
 def is_trimmed(cmd):
-    """The command's last stage is `head`/`tail` with a line count up to TRIM_MAX (none given: 10)."""
-    if not isinstance(cmd, str) or "|" not in cmd:
+    """The command reads as cut by its own final `| head -N` / `| tail -N` (see trim_lines)."""
+    return trim_lines(cmd) is not None
+
+
+def trim_fits(cmd, stdout):
+    """The command reads as trimmed and its real output agrees: no more lines than the trim lets through, and
+    normal-width lines (TRIM_LINE_AVG chars on average, none over TRIM_LINE_MAX). Earlier output that got past the
+    trim (stderr merged in, a part the text reading missed) or a few huge lines fail it, and the cap applies."""
+    n = trim_lines(cmd)
+    if n is None or not isinstance(stdout, str):
         return False
-    last = re.split(r"&&|\|\||;|\n", cmd.strip())[-1]
-    if "|" not in last:
+    text = stdout[:-1] if stdout.endswith("\n") else stdout
+    lines = text.count("\n") + 1 if text else 0
+    if lines > n or len(text) > TRIM_LINE_AVG * max(lines, 1):
         return False
-    toks = _toks(last.rsplit("|", 1)[1].strip())
-    if not toks or _bare(toks[0]) not in ("head", "tail"):
-        return False
-    n, rest = 10, [_unq(w) for w in toks[1:]]
-    for k, w in enumerate(rest):
-        m = re.match(r"^-n?(\d+)$", w) or re.match(r"^--lines=(\d+)$", w)
-        if m:
-            n = int(m.group(1))
-        elif w in ("-n", "--lines") and k + 1 < len(rest) and rest[k + 1].isdigit():
-            n = int(rest[k + 1])
-        elif "+" in w or w.startswith(("-c", "--bytes", "-f", "-F", "--follow")):
-            return False                      # +K (from line K on), bytes or follow: not a count the caller sized
-    return n <= TRIM_MAX
+    return max(map(len, text.split("\n"))) <= TRIM_LINE_MAX
 
 
 # --- the cut ---------------------------------------------------------------------------------------------------------
@@ -611,7 +826,7 @@ def native_view(stdout, response):
 
 
 def out_dir():
-    if os.name == "nt":                          # %TEMP% is per user on Windows
+    if os.name == "nt":                          # inside Big Dad's own state folder (bd_dir()/state, 2.0.9)
         return os.path.join(C.state_dir(), "bigdad-out")
     return os.path.join(C.state_dir(), f"bigdad-out-{os.getuid()}")
 
@@ -622,7 +837,8 @@ def _private(d):
     st = os.lstat(d)
     if not stat.S_ISDIR(st.st_mode):           # a symlink (lstat) is not ours to write through
         return False
-    if os.name == "nt":                        # a junction or other reparse point: same; the ACL is %TEMP%'s, per user
+    if os.name == "nt":                        # a junction or other reparse point: same; the ACL is inherited from the
+        # state folder (bd_dir()/state, 2.0.9) and not checked here; `health` reads the state folder's ACL
         return not getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     if st.st_uid != os.getuid():
         return False
@@ -631,11 +847,14 @@ def _private(d):
     return True
 
 
-OWN_NAME = re.compile(r"^[A-Za-z0-9]{1,8}-\d{8}-\d{6}-[0-9a-f]{8}-\d+\.txt$")   # {sid8}-{date}-{time}-{crc32}-{pid}.txt
+OWN_NAME = re.compile(r"^[A-Za-z0-9]{1,8}-\d{8}-\d{6}-[0-9a-f]{8}-\d+(-\d{1,2})?\.txt$")   # {sid8}-{date}-{time}-{crc32}-{pid}[-k].txt
+SAVE_TRIES = 100   # 2.0.9: the same output twice in one second (same crc, second and pid) gets -1, -2 ... -99
 
 
 def save_full(text, sid):
-    """Write the full output to a temp file; its path, or "" when it can't be saved (then nothing is cut)."""
+    """Write the full output to a new file in the state folder; its path, or "" when it can't be saved (then nothing
+    is cut). Never overwrites: the name is created with O_EXCL, and a name already taken (the same output saved
+    earlier in the same second by this process) gets the next -k suffix."""
     d = out_dir()
     try:
         if not _private(d):
@@ -654,13 +873,19 @@ def save_full(text, sid):
                         os.remove(p)
                 except OSError:
                     pass
-        name = f"{re.sub(r'[^A-Za-z0-9]', '', sid)[:8] or 'x'}-{time.strftime('%Y%m%d-%H%M%S')}-" \
-               f"{zlib.crc32(text.encode('utf-8', 'replace')) & 0xffffffff:08x}-{os.getpid()}.txt"
-        p = os.path.join(d, name)
-        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(text.encode("utf-8", "replace"))
-        return p
+        data = text.encode("utf-8", "replace")
+        stem = f"{re.sub(r'[^A-Za-z0-9]', '', sid)[:8] or 'x'}-{time.strftime('%Y%m%d-%H%M%S')}-" \
+               f"{zlib.crc32(data) & 0xffffffff:08x}-{os.getpid()}"
+        for k in range(SAVE_TRIES):
+            p = os.path.join(d, f"{stem}-{k}.txt" if k else f"{stem}.txt")
+            try:
+                fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            except FileExistsError:
+                continue                               # taken: never written over, try the next name
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return p
+        return ""
     except (OSError, ValueError):
         return ""
 
@@ -767,10 +992,20 @@ def cap_view(text, note_len):
 
 def cap_response(event, args, resp, stdout, dry=False):
     """2.0.5 cap: a command no family knows, not a file read, over CAP_CHARS: the start and the end kept, the
-    note where the middle was. Same note, saved copy and receipt row as the family shrink; None to leave it."""
-    if len(stdout) < CAP_CHARS + 4 * MIN_SAVE_TOKENS + 200 or is_file_read(args.get("command")) or \
-            is_trimmed(args.get("command")) or is_binary(stdout[:200_000]):
+    note where the middle was. Same note, saved copy and receipt row as the family shrink; None to leave it.
+    2.0.9: a command cut by its own `| head -N` / `| tail -N` is left whole only when its real output agrees
+    (trim_fits); when it doesn't, the cap applies, to a file read too (`cat app.min.js | head -3` asked for 3
+    lines, not the file; the read guard sees the note and does not mark the file as in context)."""
+    cmd = args.get("command")
+    if len(stdout) < CAP_CHARS + 4 * MIN_SAVE_TOKENS + 200:
         return None                                   # (+ the net win and the note: no copy saved just to delete it)
+    if trim_lines(cmd) is not None:
+        if trim_fits(cmd, stdout):
+            return None
+    elif is_file_read(cmd):
+        return None
+    if is_binary(stdout[:200_000]):
+        return None
     text = stdout[:-1] if stdout.endswith("\n") else stdout
     total = text.count("\n") + 1
     before = len(stdout)

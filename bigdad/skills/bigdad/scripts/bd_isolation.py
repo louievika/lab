@@ -30,7 +30,7 @@ How a run is isolated (all of it checked, not assumed):
     (plus exactly the bigdad plugin and its skill in the Big Dad arm); no hook may run in the native arm; the
     transcript is scanned for the owner's own skill/plugin names and CLAUDE.md headings.
 """
-import atexit, glob, hashlib, json, os, re, signal, subprocess, threading, time
+import atexit, glob, hashlib, json, os, re, signal, stat, subprocess, threading, time
 
 REFRESH_MARGIN = 20 * 60                      # seconds of token life a run needs
 STRIP = ("CLAUDE", "ANTHROPIC", "BIGDAD", "MCP", "AI_AGENT")   # never passed, even if named in ENV_KEEP
@@ -221,28 +221,55 @@ def logins_stuck(paths):
 
 class Auth:
     """with Auth(cfg): the auth file exists in cfg only inside the block (and is removed at exit if the block never
-    got to its end)."""
-    def __init__(self, cfg, block):
-        self.path = os.path.join(cfg, ".credentials.json")
+    got to its end). The file is created new (O_EXCL, O_NOFOLLOW where there is one): anything already at the path
+    (a file, a symlink, a dangling link, a folder) refuses the run and is left as it was, never written or deleted.
+    A copy a killed run left behind is the caller's to sweep first (sweep_logins), as bench and versus do."""
+    def __init__(self, cfg, block, src=None):
+        self.path, self.src = os.path.join(cfg, ".credentials.json"), src
         o = block.get("claudeAiOauth") if isinstance(block, dict) else None
         self.block = {"claudeAiOauth": {k: v for k, v in o.items() if k != "refreshToken"}} if isinstance(o, dict) else block
 
     def __enter__(self):
         exp = (self.block.get("claudeAiOauth") or {}).get("expiresAt") if isinstance(self.block, dict) else None
         if isinstance(exp, (int, float)) and exp / 1000 - time.time() < REFRESH_MARGIN:
-            self.block = auth_block()         # re-read the real login (it may have refreshed); raises if still short
+            self.block = auth_block(self.src)  # re-read the real login (it may have refreshed); raises if still short
         _hook_term()
         with _LIVE_LOCK:
+            ours = self.path in _LIVE
+        if ours:                              # our own copy an earlier block of this process could not delete
+            _remove_login(self.path)
+        taken = (f"something is already at {self.path}; left untouched (sweep a killed run's login copy first)")
+        # Windows has no O_NOFOLLOW, and its CREATE_NEW (what O_EXCL maps to) follows a dangling symlink and makes
+        # the target (measured 2026-11-13): so look first, and after the open check the path is the plain file we got
+        if os.path.lexists(self.path):
+            raise RuntimeError(taken)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as e:
+            if os.path.lexists(self.path):
+                raise RuntimeError(taken) from e
+            raise
+        try:
+            st = os.lstat(self.path)
+            mine = not stat.S_ISLNK(st.st_mode) and os.path.samestat(st, os.fstat(fd))
+        except OSError:
+            mine = False
+        if not mine:                          # lost a race to a link: nothing written, nothing deleted
+            os.close(fd)
+            raise RuntimeError(taken)
+        with _LIVE_LOCK:                      # ours only now: clean-up never deletes a file we did not make
             _LIVE.add(self.path)
-        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         try:
             make_private(self.path)           # before one byte of the token is in it
-        except Exception:
-            os.close(fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = None
+                json.dump(self.block, f)
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
             _remove_login(self.path)
             raise
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(self.block, f)
         return self
 
     def __exit__(self, *a):

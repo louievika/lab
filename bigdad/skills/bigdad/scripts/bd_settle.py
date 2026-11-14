@@ -132,6 +132,7 @@ def lines(s):
     out.append(f"🥛 Big Dad settle · {n} of {len(AREAS)} settled · {len(s['history'])} snapshots · {due}")
     last = s["history"][-1] if s["history"] else {}
     empty = not s["history"] and not s["settled"]
+    why = None                         # the "no data" reason: read once per run, only if an area needs it
     if empty:
         out.append(f"  no data   all {len(AREAS)} areas: {_next_snapshot()}")
     for k, (label, _, _) in ([] if empty else AREAS.items()):
@@ -144,7 +145,8 @@ def lines(s):
             was = f"{_fmt(k, prev)} -> " if prev is not None else ""
             out.append(f"  moving    {label}: {was}{_fmt(k, last[k])}: audit and cut here")
         else:
-            out.append(f"  no data   {label}: {_next_snapshot()}")
+            why = _next_snapshot() if why is None else why
+            out.append(f"  no data   {label}: {why}")
     for g in s.get("grew", [])[-3:]:
         if g.get("area") in AREAS:
             out.append(f"  grew back {AREAS[g['area']][0]}: {_fmt(g['area'], g['from'])} -> {_fmt(g['area'], g['to'])} "

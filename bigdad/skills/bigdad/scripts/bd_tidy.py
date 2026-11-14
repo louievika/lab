@@ -3,6 +3,9 @@
 What counts as a leftover (older than N days, default 7):
   - per-session state files the hooks write (bigdad-guard-, -reads-, -beat-, -reload-, -loop-, -watch-, -stop-, -bgwatch-,
     -outline-, -redirect-, -soft-, -agentscan-, -burn-, -pending-)
+  - the same files, and the saved full outputs (bigdad-out, bigdad-out-<uid>), that 2.0.8 and earlier left in the
+    system temp folder ("old temp"; only when BIGDAD_STATE_DIR is not set, since then 2.0.8 wrote there too). In that
+    shared folder only entries that are ours are moved: never a link or junction, never another user's (POSIX owner).
   - Claude Code project folders from Big Dad's own headless test runs (probe / proof)
 Never touched: the user's session logs, skills, plugins, settings, Big Dad's own logs
 (agents/notes/receipts .jsonl: they are the evidence).
@@ -12,13 +15,14 @@ Never touched: the user's session logs, skills, plugins, settings, Big Dad's own
   tidy undo     put the newest batch back
   tidy empty    delete Big Dad's trash for good (only its own trash folder)
 """
-import json, os, re, shutil, sys, time
+import json, os, re, shutil, stat, sys, time
 
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "hooks")))
 import bd_common as C
 
 STATE = re.compile(r"^bigdad-(guard|reads|beat|reload|loop|watch|stop|bgwatch|outline|redirect|soft|agentscan|burn|pending)-[\w.-]+$")
 OWN_RUNS = re.compile(r"bigdad-(probe|proof)-[\w-]+$")
+OLD_OUT = re.compile(r"^bigdad-out(-\d+)?$")       # 2.0.8's saved full outputs in the temp folder (shrink.out_dir)
 
 
 def days():
@@ -54,14 +58,41 @@ def newest(p):
     return t
 
 
+def ours(p):
+    """An entry in the shared old temp folder Big Dad may move: not a link or junction, and on POSIX owned by us."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+        return False
+    return os.name == "nt" or st.st_uid == os.geteuid()
+
+
 def leftovers():
     cut = time.time() - days() * 86400
     out = []
-    sd = C.state_dir()
+    sd = C.state_dir()                 # a refused state folder is never looked in (C.NO_STATE: nothing there)
     for n in sorted(os.listdir(sd)) if os.path.isdir(sd) else ():
         p = os.path.join(sd, n)
         if STATE.match(n) and os.path.isfile(p) and os.path.getmtime(p) < cut:
             out.append(("state", p))
+    old = C.legacy_state_dir()
+    if old and os.path.isdir(old) and not C.same_file(old, C.state_path()):
+        try:
+            names = sorted(os.listdir(old))
+        except OSError:
+            names = []
+        for n in names:
+            p = os.path.join(old, n)
+            if not (STATE.match(n) or OLD_OUT.match(n)) or not ours(p):
+                continue
+            try:
+                if (os.path.isfile(p) and STATE.match(n) and os.path.getmtime(p) < cut) or (
+                        os.path.isdir(p) and OLD_OUT.match(n) and newest(p) < cut):
+                    out.append(("old temp", p))
+            except OSError:
+                continue
     proj = os.path.join(C.config_dir(), "projects")
     for n in sorted(os.listdir(proj)) if os.path.isdir(proj) else ():
         p = os.path.join(proj, n)
@@ -95,6 +126,8 @@ def cmd_tidy(rest):
         return empty()
     items = leftovers()
     print(f"🥛 == TIDY  Big Dad's own leftovers older than {days():g} days (never your logs, skills or settings)")
+    if C.state_problem():
+        print(f"  state folder not looked in, it was refused: {C.state_problem()}")
     if not items:
         print("  nothing to tidy.")
         return

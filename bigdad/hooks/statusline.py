@@ -95,7 +95,10 @@ def line(event, color=True, now=None):
     pause = C.pause_at()
     stop = pause or 2.0                       # red: the pause point if set, else 2x the guide
     paint = (lambda c, s: f"{c}{s}{END}") if color else (lambda c, s: s)
-    if path and C.hooks_off(path, sid):         # the status line runs from settings.json; the hooks may not
+    if C.state_problem():                       # 2.0.9: no private state folder, so the hooks stay idle (bd_common)
+        return f"🥛 {paint(YELLOW, 'Big Dad idle')}: state folder refused · `bigdad.py health`" + (
+            f" · 💲{tokens // 1000:,}k/call" if tokens else "")
+    if path and C.hooks_off(path, sid):        # the status line runs from settings.json; the hooks may not
         return f"🥛 {paint(RED, 'Big Dad OFF')}: run /reload-plugins" + (f" · 💲{tokens // 1000:,}k/call" if tokens else "")
     if not tokens:
         return f"🥛█ {paint(BOLD, 'Big Dad')} 🟢 {paint(DIM, f'watching · guide {limit // 1000}k/call')}"

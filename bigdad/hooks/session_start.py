@@ -141,10 +141,13 @@ def main(event=None, standalone=True):
     if C.off("BIGDAD_GUARD"):
         mark_loaded()                  # off on purpose is still "loaded": the sentinel must not cry wolf
         return
-    event = C.read_event() if event is None else event
+    event = C.read_event(need_state=False) if event is None else event
     if event is None:
         mark_loaded()
         return
+    if C.state_problem():              # 2.0.9: no private state folder; the other hooks stay idle, so say why, once here
+        mark_loaded(C.dstr(event.get("session_id")))
+        return C.emit({"systemMessage": C.idle_line()}, standalone)
     source = C.dstr(event.get("source")) or "startup"
     mark_loaded(C.dstr(event.get("session_id")))
     if source == "compact" and C.dstr(event.get("session_id")):

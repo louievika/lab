@@ -4,7 +4,7 @@ Hooks must never crash or block: bad stdin, odd field types and missing files al
 quiet exit. Big Dad's own knobs come from ~/.claude/bigdad/profile.json (written by
 `bigdad.py setup`), with environment variables on top; global defaults when neither exists.
 """
-import base64, json, os, re, struct, sys, tempfile, time
+import base64, json, os, re, stat, struct, sys, tempfile, time
 
 DEFAULT_GUARD_AT = 130_000
 # The read guard's deny reasons all end in READ_DENY_TAIL (read_guard.deny_text uses it), and the receipt
@@ -89,14 +89,18 @@ def est_tokens(obj):
 PATH_KEYS = ("transcript_path", "agent_transcript_path")
 
 
-def read_event():
+def read_event(need_state=True):
     """The hook event as a dict, or None for anything that isn't one (empty, text, null, list). Log paths are
-    cleaned up once here (real_path), so every hook reads the same file whatever shape the path came in."""
+    cleaned up once here (real_path), so every hook reads the same file whatever shape the path came in.
+    None as well when need_state and the state folder is refused (state_problem): a hook with nowhere private to keep
+    its state acts as if it got nothing (no note, no deny, no write). The session start passes need_state=False."""
     try:
         e = json.load(sys.stdin)
     except (ValueError, OSError, UnicodeDecodeError):
         return None
     if not isinstance(e, dict):
+        return None
+    if need_state and state_problem():
         return None
     bases = [os.path.dirname(real_path(dstr(e.get("transcript_path")))), dstr(e.get("cwd"))]
     for k in PATH_KEYS:
@@ -176,8 +180,104 @@ def bd_dir():
     return os.environ.get("BIGDAD_HOME") or os.path.join(config_dir(), "bigdad")
 
 
+# PRIVATE STATE FOLDER (2.0.9, outside review). Per-session state (guard, reads, watch flags, saved full outputs) used
+# to sit in the system temp folder: /tmp on Linux and macOS, where other local users can read it, pre-create the names
+# or plant symlinks. It now lives in bd_dir()/state (or BIGDAD_STATE_DIR), checked once per process (state_problem):
+#   - a real folder: not a symlink, not a Windows junction or other reparse point, not a file;
+#   - POSIX: owned by us (euid); a folder we own that group or others can open is set to 0700, through a handle
+#     opened with O_NOFOLLOW, so a link swapped in after the check is not what gets the chmod;
+#   - POSIX, the parent only (one stat): owned by us or root, and not writable by every user unless sticky (like /tmp).
+#     Otherwise another user could rename our folder away and put their own in its place. Grandparents and the
+#     group-write bit are not checked: a user's own folders are often group-writable (umask 002), and a parent we or
+#     root own can only be changed by us or root.
+#   - Windows: no ACL check here (a hook stays cheap). The default place inherits the user profile's ACL (you, SYSTEM,
+#     Administrators); `health` reads the real ACL of whatever folder is in use.
+# A refused folder: state_dir() gives NO_STATE, a path under this .py file, where every open, makedirs and listdir
+# fails with OSError and glob finds nothing, so nothing is written anywhere; read_event() gives no event (the hook acts
+# as if it was called with nothing: no note, no deny, no write). The session start and the status line say it in one
+# line; `bigdad.py health` gives the reason.
+NO_STATE = os.path.join(os.path.abspath(__file__), "no-state")
+_state_cache = {}
+
+
+def state_path():
+    """Where Big Dad keeps per-session state, unchecked: BIGDAD_STATE_DIR, else bd_dir()/state. For display (health,
+    tidy); everything that reads or writes state goes through state_dir()."""
+    return os.path.abspath(os.environ.get("BIGDAD_STATE_DIR") or os.path.join(bd_dir(), "state"))
+
+
+def check_state_dir(p):
+    """'' when p is usable as Big Dad's private state folder (made if missing, tightened to 0700 on POSIX when we own
+    it), else one plain line why not. A few syscalls, no subprocess: hooks call it once per process."""
+    try:
+        if not os.path.lexists(p):
+            os.makedirs(p, mode=0o700, exist_ok=True)      # the mode is for the leaf; the umask can only take bits off
+        st = os.lstat(p)
+    except OSError as e:
+        return f"{p} could not be made or read ({e.strerror or e.__class__.__name__})"
+    if stat.S_ISLNK(st.st_mode):
+        return f"{p} is a symlink (it could point anywhere)"
+    if getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+        return f"{p} is a junction or other reparse point (it could point anywhere)"
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{p} is not a folder"
+    if os.name == "nt":
+        return ""
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        return f"{p} could not be opened ({e.strerror or e.__class__.__name__})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{p} is not a folder"
+        if st.st_uid != os.geteuid():
+            return f"{p} belongs to another user (uid {st.st_uid})"
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+            if os.fstat(fd).st_mode & 0o077:
+                return f"{p} is open to other users and could not be set to 0700"
+    except OSError as e:
+        return f"{p} is open to other users and could not be set to 0700 ({e.strerror or e.__class__.__name__})"
+    finally:
+        os.close(fd)
+    parent = os.path.dirname(p)
+    try:
+        pst = os.stat(parent)
+    except OSError as e:
+        return f"its parent folder {parent} could not be read ({e.strerror or e.__class__.__name__})"
+    if pst.st_uid not in (0, os.geteuid()):
+        return f"its parent folder {parent} belongs to another user (uid {pst.st_uid}), who could swap it"
+    if pst.st_mode & 0o002 and not pst.st_mode & stat.S_ISVTX:
+        return f"its parent folder {parent} is writable by every user (and not sticky), so it could be swapped"
+    return ""
+
+
+def state_problem():
+    """'' when the state folder is usable, else the reason it was refused (one line). Checked once per process and
+    folder."""
+    p = state_path()
+    if p not in _state_cache:
+        _state_cache[p] = check_state_dir(p)
+    return _state_cache[p]
+
+
 def state_dir():
-    return os.environ.get("BIGDAD_STATE_DIR") or tempfile.gettempdir()
+    """Big Dad's private per-session state folder (bd_dir()/state, or BIGDAD_STATE_DIR), checked by state_problem().
+    Refused: NO_STATE, where nothing can be written or found."""
+    return NO_STATE if state_problem() else state_path()
+
+
+def legacy_state_dir():
+    """Where 2.0.8 and earlier kept state when BIGDAD_STATE_DIR was not set: the system temp folder. None when it is
+    set (then the old place was that folder too). tidy and health look here for old leftovers."""
+    return None if os.environ.get("BIGDAD_STATE_DIR") else tempfile.gettempdir()
+
+
+def idle_line():
+    """The one line the session start and the status line give when the state folder is refused."""
+    return (f"🥛 Big Dad is idle: its state folder was refused: {state_problem()}. Its hooks write nothing and say "
+            "nothing until it is fixed; `bigdad.py health` shows it.")
 
 
 def profile():
@@ -474,8 +574,9 @@ def beat_file(sid):
 
 def hooks_off(path, sid):
     """True when this chat has 3+ tool calls but the per-tool-call hook never wrote its heartbeat: the session
-    started before Big Dad's hooks were installed or updated. Fix: /reload-plugins."""
-    if not path or os.path.exists(beat_file(sid or "x")):
+    started before Big Dad's hooks were installed or updated. Fix: /reload-plugins. False when the state folder is
+    refused: the hooks run, they just have nowhere private to write the heartbeat."""
+    if not path or state_problem() or os.path.exists(beat_file(sid or "x")):
         return False
     return len(re.findall(r'"type":\s*"tool_use"', tail_text(path, 400_000))) >= 3
 

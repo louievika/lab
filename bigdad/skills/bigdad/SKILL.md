@@ -41,8 +41,8 @@ if shared): that is the baseline.
 - **Learning first:** with no baseline yet, the hooks only count (no blocks, cuts or notes) until the baseline covers
   30 calls; `baseline` shows the counts. Report them as observed, never as saved. `BIGDAD_LEARN=off` acts at once.
 - **One goal:** hold the end goal in the user's newest words. Plan ended ("scrap this"): open with one line: old plan
-  dropped; offer a `/compact` (on a yes). New direction or "btw": follow the hook's note; rest in
-  `references/detail.md` (Redirects).
+  dropped; close the previews, players and jobs it opened, mark its drafts superseded; offer a `/compact` (on a yes).
+  New direction or "btw": follow the hook's note; rest in `references/detail.md` (Redirects).
 - **Agents:** set `model` on every Agent call (cheapest tier for lookups). A fork re-sends the whole chat: prefer a
   fresh agent with a short brief (paths, not pasted text). For a heavy agent offer `autoCompactWindow` in its
   frontmatter first (restart open sessions to apply); `agent-stop` is the fallback. An agent over the guide finishes

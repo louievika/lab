@@ -4,10 +4,11 @@ Security: bypass or broad allow rules, hook commands that fetch-and-run or point
 files, plaintext secrets in settings env (names only, never values), unpinned npx MCP servers.
 Health: broken skill links, duplicate skill names, enabled-but-missing plugins, a directory
 plugin whose source is newer than the installed copy, MEMORY.md over the load limit or pointing
-at missing files, CLAUDE.md/AGENTS.md size and duplication, ~/.claude folder sizes, old Big Dad
-temp files. Reports and proposes; changes nothing.
+at missing files, CLAUDE.md/AGENTS.md size and duplication, ~/.claude folder sizes, Big Dad's
+state folder (where it is, whether it was refused, its Windows ACL) and the old leftovers `tidy` would
+move. Reports and proposes; changes nothing.
 """
-import glob, json, os, re, sys, tempfile, time
+import glob, json, os, re, sys, time
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -401,6 +402,130 @@ def sentinel_status():
     return {"hook": hook, "statusline": "sentinel.py" in str(sl.get("command") or "")}
 
 
+def common():
+    """hooks/bd_common (state folder, its check, the old temp place)."""
+    hooks = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "hooks"))
+    if hooks not in sys.path:
+        sys.path.insert(0, hooks)
+    import bd_common
+    return bd_common
+
+
+# Trustees that may open a Big Dad folder on Windows without a finding (SDDL aliases): SYSTEM, Administrators, the
+# folder's owner and creator-owner placeholders. The current user's own SID is added at run time.
+ACL_FINE = {"SY", "BA", "OW", "CO"}
+ACL_NAMES = {"WD": "Everyone", "AU": "Authenticated Users", "BU": "Users", "BG": "Guests", "IU": "Interactive users",
+             "NU": "Network logons", "AN": "Anonymous", "AC": "All application packages", "BO": "Backup operators",
+             "PU": "Power users", "RD": "Remote desktop users", "S-1-1-0": "Everyone", "S-1-5-11": "Authenticated Users",
+             "S-1-5-32-545": "Users"}
+
+
+def win_acl_others(path):
+    """Windows only: who besides you, SYSTEM and Administrators gets an allow entry on path's ACL (names, or SIDs when
+    there is no common name); [] when nobody; None when it can't be read (or not Windows). Read with the Win32 API
+    (GetNamedSecurityInfoW -> SDDL), so names are not localized and nothing is started."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        vp = ctypes.c_void_p
+        k32.LocalFree.argtypes, k32.LocalFree.restype = [vp], vp
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        adv.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD] + [ctypes.POINTER(vp)] * 5
+        adv.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+            vp, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.ULONG)]
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, vp, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        adv.ConvertSidToStringSidW.argtypes = [vp, ctypes.POINTER(wintypes.LPWSTR)]
+        OWNER, DACL = 0x1, 0x4
+        psd = vp()
+        if adv.GetNamedSecurityInfoW(path, 1, OWNER | DACL, None, None, None, None, ctypes.byref(psd)):
+            return None                                   # 1 = SE_FILE_OBJECT; nonzero = an error code
+        try:
+            s = wintypes.LPWSTR()
+            if not adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(psd, 1, OWNER | DACL, ctypes.byref(s), None):
+                return None
+            sddl = s.value or ""
+            k32.LocalFree(ctypes.cast(s, vp))
+        finally:
+            k32.LocalFree(psd)
+        tok = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x8, ctypes.byref(tok)):   # TOKEN_QUERY
+            return None
+        try:
+            n = wintypes.DWORD()
+            adv.GetTokenInformation(tok, 1, None, 0, ctypes.byref(n))                     # 1 = TokenUser
+            buf = ctypes.create_string_buffer(n.value or 1)
+            if not adv.GetTokenInformation(tok, 1, buf, n, ctypes.byref(n)):
+                return None
+            ssid = wintypes.LPWSTR()
+            if not adv.ConvertSidToStringSidW(ctypes.cast(buf, ctypes.POINTER(vp))[0], ctypes.byref(ssid)):
+                return None
+            me = ssid.value
+            k32.LocalFree(ctypes.cast(ssid, vp))
+        finally:
+            k32.CloseHandle(tok)
+    except (OSError, AttributeError, ValueError):
+        return None
+    dacl = sddl.split("D:", 1)[1] if "D:" in sddl else ""
+    dacl = re.split(r"\b[SG]:", dacl)[0]
+    out = []
+    for ace in re.findall(r"\(([^)]*)\)", dacl):
+        f = ace.split(";")
+        if len(f) < 6 or f[0] != "A":                     # only allow entries give access
+            continue
+        who = f[5]
+        if who in ACL_FINE or who == me:
+            continue
+        name = ACL_NAMES.get(who, who)
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def state_check():
+    """Big Dad's state folder (2.0.9: private, no longer the shared temp folder) and the leftovers tidy would move."""
+    C = common()
+    p, problem, override = C.state_path(), C.state_problem(), bool(os.environ.get("BIGDAD_STATE_DIR"))
+    if problem:
+        fix = ("point BIGDAD_STATE_DIR at a folder only you can open, or unset it" if override else
+               "move what is in the way aside")
+        say("sec", f"Big Dad's state folder was refused: {problem}. Its hooks write nothing and say nothing until it is "
+                   f"fixed. Proposal: {fix} (default: {os.path.join(C.bd_dir(), 'state')}).", keepable=False)
+    elif os.name != "nt":
+        say("ok", f"state folder: {p} (a real folder, yours, mode 0700)")
+    else:
+        others = win_acl_others(p)
+        what = "a real folder, not a junction or link"
+        if others is None:
+            say("info", f"state folder: {p} ({what}; its Windows ACL could not be read, so who else can open it is "
+                        "not checked)")
+        elif others:
+            say("sec", f"state folder: {p} ({what}), but its Windows ACL lets others open it: {', '.join(others)}. "
+                       "Saved command output there can hold secrets. Proposal: "
+                       + ("unset BIGDAD_STATE_DIR (the default folder inherits your profile's ACL)" if override else
+                          "remove those entries from the folder's ACL") + ".", keepable=False)
+        else:
+            say("ok", f"state folder: {p} ({what}; Windows ACL: only you, SYSTEM and Administrators)")
+    try:
+        import bd_tidy as T
+        items = T.leftovers()
+    except Exception:
+        return
+    old = sum(k == "old temp" for k, _ in items)
+    if items:
+        say("fix", f"{len(items)} Big Dad leftover(s) older than {T.days():g} days"
+            + (f", {old} of them in the old temp folder ({C.legacy_state_dir()}, from before 2.0.9)" if old else "")
+            + ". `bigdad.py tidy` lists them; `tidy yes` moves them to Big Dad's trash; `tidy undo` puts them back.")
+    else:
+        say("ok", "no old Big Dad leftovers" + (" (state folder and old temp folder)" if C.legacy_state_dir() else "") + ".")
+
+
 def cmd_health(cwd=None):
     cwd = cwd or os.getcwd()
     print("🥛 == HEALTH [claude] security + upkeep (read-only; proposes, never changes)")
@@ -566,13 +691,8 @@ def cmd_health(cwd=None):
             + ("" if level == "ok" else ". Over ~1 s per tool call adds up; drop hooks you don't use."))
     # ---- private usage committed in the working folder (before publishing)
     privacy_scan(cwd)
-    # ---- big dad leftovers
-    tmp = os.environ.get("BIGDAD_STATE_DIR") or tempfile.gettempdir()
-    old = [p for p in glob.glob(os.path.join(tmp, "bigdad-*")) if time.time() - os.path.getmtime(p) > 86_400]
-    if old:
-        say("fix", f"{len(old)} Big Dad temp file(s)/folder(s) older than a day in the temp dir. Safe to delete: `rm -rf <temp>/bigdad-*` (ask first).")
-    else:
-        say("ok", "no stale Big Dad temp files.")
+    # ---- big dad's state folder and leftovers (2.0.9: tidy moves them, reversibly; no delete line)
+    state_check()
     n_sec, n_fix, n_kept = FINDINGS.count("sec"), FINDINGS.count("fix"), FINDINGS.count("kept")
     print(f"  {n_sec} security finding(s), {n_fix} fix(es) proposed" + (f", {n_kept} kept by you" if n_kept else "")
           + ". Each is a proposal: change only with a yes, then rerun `health`.")
