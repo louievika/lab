@@ -11,14 +11,7 @@
 
 ## Watch the ad
 
-<!-- VIDEO: paste the user-attachments URL on the next line -->
-
-
-<!-- POSTER START: stand-in until the video is uploaded. Delete from here to POSTER END once the URL line above is filled in. -->
-<p align="center">
-  <a href="#watch-the-ad"><img src="assets/poster.jpg" width="100%" alt="Watch the ad. Every call re-sends everything."></a>
-</p>
-<!-- POSTER END -->
+https://github.com/user-attachments/assets/1021fd70-1975-4621-9497-18a5dfa49e3c
 
 <p align="center">
   <img src="assets/preview-loop.webp" width="80%" alt="Silent loop from the ad. Same file read 3 times: on Haiku $0.0095 without Big Dad, $0.0048 with, -49.4%. On Sonnet $0.1745 to $0.0819, -53.1%.">
