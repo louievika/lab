@@ -14,7 +14,9 @@ CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"
 MEMORY_LINES = 200          # Claude Code loads the first 200 lines of MEMORY.md
 SECRET = re.compile(r"(key|token|secret|passw|credential|auth)", re.I)
 FETCH_RUN = re.compile(r"(curl|wget|iwr|Invoke-WebRequest|irm)\b.*(\|\s*(sh|bash|zsh|python\d?|node|pwsh|powershell|iex)\b|Invoke-Expression)", re.I)
-BROAD = {"*", "Bash", "Bash(*)", "Bash(*:*)", "Bash(:*)", "Write", "Edit", "MultiEdit", "Agent", "Task"}
+BROAD = {"*", "Bash", "Bash(*)", "Bash(*:*)", "Bash(:*)", "Write", "Edit", "MultiEdit"}
+# (Agent/Task are not here: starting a subagent asks no permission, and the subagent's own tools still go through
+# the same rules, so an allow rule for it opens nothing new.)
 FINDINGS = []
 
 
@@ -411,9 +413,15 @@ def cmd_health(cwd=None):
         perm = s.get("permissions") or {}
         if perm.get("defaultMode") in ("bypassPermissions", "dontAsk") or s.get("skipDangerousModePermissionPrompt"):
             say("sec", f"{rel(p)}: defaultMode {perm.get('defaultMode')}: every tool runs unasked. Prefer `acceptEdits` or auto mode.")
-        wide = [r for r in perm.get("allow") or [] if r in BROAD or re.fullmatch(r"\w+\(\*\)", r)]
+        wide = [r for r in perm.get("allow") or [] if r in BROAD or re.fullmatch(r"(?!(Agent|Task)\()\w+\(\*\)", r)]
         if wide:
-            say("sec", f"{rel(p)}: broad allow rule(s) {wide}: narrow to the commands you mean, e.g. `Bash(git status:*)`.")
+            eg = []                                          # an example that fits the rules found
+            if any(r.startswith("Bash") or r == "*" for r in wide):
+                eg.append("`Bash(git status:*)`")
+            if any(r.split("(")[0] in ("Write", "Edit", "MultiEdit") or r == "*" for r in wide):
+                eg.append("`Edit(./src/**)`")
+            say("sec", f"{rel(p)}: broad allow rule(s) {wide}: narrow to what you mean"
+                       + (f", e.g. {' or '.join(eg)}." if eg else "."))
         env = s.get("env") or {}
         leaks = [k for k, v in env.items() if SECRET.search(k) and isinstance(v, str) and v and not v.startswith("${")]
         if leaks:

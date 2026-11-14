@@ -174,6 +174,28 @@ def last_check_age(inv):
         return None
 
 
+def own_market_line(plugins):
+    """Big Dad's installed version next to the newest one this PC knows: its marketplace copy, as Claude Code last
+    fetched it (known_marketplaces.json lastUpdated). Offline and local only: a newer release upstream shows up
+    after the marketplace is updated, so the line says when that copy was fetched instead of guessing."""
+    for name, (_, ver, _) in plugins.items():
+        if name.split("@")[0] != "bigdad" or "@" not in name:
+            continue
+        mk = name.split("@", 1)[1]
+        m = (H.load_json(os.path.join(H.CLAUDE_DIR, "plugins", "known_marketplaces.json")) or {}).get(mk) or {}
+        loc = m.get("installLocation") or ""
+        entry = [p for p in (H.load_json(os.path.join(loc, ".claude-plugin", "marketplace.json")) or {}).get("plugins") or []
+                 if isinstance(p, dict) and p.get("name") == "bigdad"] if loc else []
+        mv = str(entry[0].get("version") or "") if entry else ""
+        if not mv:
+            return f"  Big Dad: installed {ver}; marketplace copy has no version to compare. Not checked online."
+        when = str(m.get("lastUpdated") or "?")[:16].replace("T", " ")
+        state = (f"{mv} is ready: update it from `/plugin`" if vtuple(mv) > vtuple(ver) else
+                 f"newest this PC knows; `/plugin marketplace update {mk}` fetches newer")
+        return f"  Big Dad: installed {ver}, marketplace copy {mv} (fetched {when} UTC): {state}. Not checked online."
+    return ""
+
+
 def cmd_fresh(cwd=None):
     cwd = cwd or os.getcwd()
     new = snapshot(cwd)
@@ -191,6 +213,12 @@ def cmd_fresh(cwd=None):
         print(f"  Claude Code: installed {inst}, latest {latest} ({state}; changelog top {latest_cl or '?'}, npm {latest_npm or 'unreachable'})")
     else:
         print(f"  Claude Code: installed {inst}; latest unknown ({how}; npm unreachable). Offline: no guess made.")
+    try:
+        own = own_market_line(H.installed_plugins())
+    except Exception:
+        own = ""
+    if own:
+        print(own)
     print(f"  setup now: {len(new['skills'])} skill folders on disk (yours + enabled plugins + synced), {len(new['plugins'])} plugins,"
           f" {len(new['mcp'])} MCP servers/connectors, {len(new['hooks'])} hook commands"
           + (f"; last snapshot {old.get('at', '')[:16].replace('T', ' ')}" if old else ""))

@@ -1,7 +1,8 @@
 """Big Dad tidy: clear Big Dad's own leftovers, never the user's.
 
 What counts as a leftover (older than N days, default 7):
-  - per-session state files the hooks write (bigdad-guard-, -reads-, -beat-, -reload-, -loop-, -watch-, -stop-, -bgwatch-)
+  - per-session state files the hooks write (bigdad-guard-, -reads-, -beat-, -reload-, -loop-, -watch-, -stop-, -bgwatch-,
+    -outline-, -redirect-, -soft-, -agentscan-, -burn-, -pending-)
   - Claude Code project folders from Big Dad's own headless test runs (probe / proof)
 Never touched: the user's session logs, skills, plugins, settings, Big Dad's own logs
 (agents/notes/receipts .jsonl: they are the evidence).
@@ -16,7 +17,7 @@ import json, os, re, shutil, sys, time
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "hooks")))
 import bd_common as C
 
-STATE = re.compile(r"^bigdad-(guard|reads|beat|reload|loop|watch|stop|bgwatch)-[\w.-]+$")
+STATE = re.compile(r"^bigdad-(guard|reads|beat|reload|loop|watch|stop|bgwatch|outline|redirect|soft|agentscan|burn|pending)-[\w.-]+$")
 OWN_RUNS = re.compile(r"bigdad-(probe|proof)-[\w-]+$")
 
 

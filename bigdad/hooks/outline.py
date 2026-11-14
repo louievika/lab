@@ -95,8 +95,8 @@ def _first_big_read(event, note):
             C.learn_seen("big_read")                      # learning first (2.0.6): counted; no outline, note or row
             return None
         if note and size > READ_MAX_BYTES and not args.get("allow_large"):
-            return (f"🥛 Big Dad: {name} is {len(lines):,} lines (~{size // 4:,} tokens), over the 256 KB Read limit, so "
-                    "this Read is refused and reads nothing. Grep its headings or defs first and Read only the part you "
+            return (f"🥛 Big Dad: {name} is {len(lines):,} lines (~{size // 4:,} tokens), over the {READ_MAX_BYTES // 1024} KB "
+                    "whole-Read limit Claude Code enforced when Big Dad last checked; a refused Read reads nothing. Grep its headings or defs first and Read only the part you "
                     "need (offset/limit).")               # 2.0.5: not marked as noted, no row: nothing came in
         sid = re.sub(r"[^A-Za-z0-9-]", "", C.dstr(event.get("session_id")) or "x")[:64]
         st = os.path.join(C.state_dir(), f"bigdad-outline-{sid}-{re.sub(r'[^A-Za-z0-9-]', '', agent)[:40] or 'main'}.json")

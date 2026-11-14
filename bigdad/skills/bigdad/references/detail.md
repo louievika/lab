@@ -2,6 +2,15 @@
 
 Moved out of SKILL.md in 2.0.2 so the skill page costs less on every call after `/bigdad`. Nothing here is a new rule.
 
+## Redirects
+
+- **New direction:** say in one line which earlier reads and drafts no longer serve the goal, and offer a slim
+  `/compact` (on a yes).
+- **Side question** ("btw ..."): answer briefly, no file reads; `/btw` keeps one out of the chat.
+- **Plan ended** ("scrap this", "start over", "from scratch", "throw it out"): say so in one line, close the
+  previews, players and jobs opened for the old plan, mark its drafts superseded, and offer a `/compact` that drops
+  it (compact only on a yes). Softer ("never mind", "forget that"): a note only.
+
 ## Commands, full list
 
     fresh        today's date, installed vs latest Claude Code, changelog lines since last check, setup diff. Run FIRST when the profile or last check is older than a few days.

@@ -15,7 +15,7 @@ the gaps: the warning nobody gives, the per-agent size, the measurement, the pro
 
 ## Commands: `sh <this skill's folder>/scripts/bigdad.sh <cmd>`
 
-Same command on Windows, macOS and Linux: it finds Python 3 itself. Where output says `bigdad.py <cmd>`,
+Same command on every OS: it finds Python 3 itself. Where output says `bigdad.py <cmd>`,
 run it this way.
 
 `fresh` (run first when the last check is days old) · `settle` · `self [DAYS]` (Big Dad's own cost vs saved) · `all 10` ·
@@ -24,7 +24,7 @@ run it this way.
 only: `agent-stop 100k`, `pause 2`, `sentinel on`, `statusline on`, `tidy yes`, `settle reset`, and `probe`, `proof`,
 `compare` (live runs that cost money).
 Full list, surfaces table, cut table, measured `autoCompactWindow` results, agent hard stop and the watch loop:
-`references/detail.md` (Read it only when the task needs that part). Save output before a cut (`> file`, `--redact`
+`references/detail.md` (Read only the part needed). Save output before a cut (`> file`, `--redact`
 if shared): that is the baseline.
 
 ## Rules
@@ -40,9 +40,9 @@ if shared): that is the baseline.
   or grown back. A proven cut is done: don't propose it again. Settled areas get a drift check every 21 days.
 - **Learning first:** with no baseline yet, the hooks only count (no blocks, cuts or notes) until the baseline covers
   30 calls; `baseline` shows the counts. Report them as observed, never as saved. `BIGDAD_LEARN=off` acts at once.
-- **One goal:** hold the end goal in the user's newest words. A prompt that changes direction: say in one line
-  which earlier reads and drafts no longer serve the goal, and offer a slim `/compact` (on a yes). A side question
-  ("btw ..."): answer briefly, no file reads; `/btw` keeps one out of the chat.
+- **One goal:** hold the end goal in the user's newest words. Plan ended ("scrap this"): open with one line: old plan
+  dropped; offer a `/compact` (on a yes). New direction or "btw": follow the hook's note; rest in
+  `references/detail.md` (Redirects).
 - **Agents:** set `model` on every Agent call (cheapest tier for lookups). A fork re-sends the whole chat: prefer a
   fresh agent with a short brief (paths, not pasted text). For a heavy agent offer `autoCompactWindow` in its
   frontmatter first (restart open sessions to apply); `agent-stop` is the fallback. An agent over the guide finishes
@@ -51,9 +51,6 @@ if shared): that is the baseline.
   Trim command output (`| tail -40`). A shrunk Bash output ends with a "[🥛 Big Dad shrink: ...]" note naming the
   full output's file: Grep or Read that file with offset/limit; don't re-run the command. When the guard says a
   call is over the guide, suggest `/compact` or a fresh session at the next natural break.
-- **Plan ended** ("scrap this", "start over", "from scratch", "throw it out"): say so in one line, close the
-  previews, players and jobs opened for the old plan, mark its drafts superseded, and offer a `/compact` that drops
-  it (compact only on a yes). Softer ("never mind", "forget that"): a note only.
 - Only `/compact`, `/clear` or a fresh chat or agent shrinks context; every call re-sends the whole chat ("cache
   read" is that re-send). Images cost ~width*height/750 tokens.
 

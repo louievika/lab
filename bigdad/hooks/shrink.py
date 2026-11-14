@@ -31,6 +31,7 @@ permission rules see and has broken exit codes and Windows quoting for them. Big
   - Cap (2.0.5): output of a command no family knows, over 4,000 chars, keeps its start and its end; the note
     sits where the middle was and names the full copy. File reads are exempt (every part of the command starts
     with cat/head/tail/sed/grep/rg/awk/Get-Content..., or git show REV:PATH): the model asked for that text.
+    So is output already cut by a final `| tail -N` / `| head -N` (N up to 200): the caller chose that cut.
   - Any internal error: no output, so Claude sees the original.
 
   BIGDAD_SHRINK=off          turn it off (or `bigdad.py shrink off`, which writes ~/.claude/bigdad/shrink)
@@ -359,6 +360,31 @@ def is_file_read(cmd):
             head = "cat"                       # git show REV:PATH prints a file
         verbs.append(head)
     return bool(verbs) and all(v in READ_VERBS for v in verbs)
+
+
+TRIM_MAX = 200     # a final `| tail -N` / `| head -N` up to this many lines is the caller's own cut: the cap leaves it
+
+
+def is_trimmed(cmd):
+    """The command's last stage is `head`/`tail` with a line count up to TRIM_MAX (none given: 10)."""
+    if not isinstance(cmd, str) or "|" not in cmd:
+        return False
+    last = re.split(r"&&|\|\||;|\n", cmd.strip())[-1]
+    if "|" not in last:
+        return False
+    toks = _toks(last.rsplit("|", 1)[1].strip())
+    if not toks or _bare(toks[0]) not in ("head", "tail"):
+        return False
+    n, rest = 10, [_unq(w) for w in toks[1:]]
+    for k, w in enumerate(rest):
+        m = re.match(r"^-n?(\d+)$", w) or re.match(r"^--lines=(\d+)$", w)
+        if m:
+            n = int(m.group(1))
+        elif w in ("-n", "--lines") and k + 1 < len(rest) and rest[k + 1].isdigit():
+            n = int(rest[k + 1])
+        elif "+" in w or w.startswith(("-c", "--bytes", "-f", "-F", "--follow")):
+            return False                      # +K (from line K on), bytes or follow: not a count the caller sized
+    return n <= TRIM_MAX
 
 
 # --- the cut ---------------------------------------------------------------------------------------------------------
@@ -743,7 +769,7 @@ def cap_response(event, args, resp, stdout, dry=False):
     """2.0.5 cap: a command no family knows, not a file read, over CAP_CHARS: the start and the end kept, the
     note where the middle was. Same note, saved copy and receipt row as the family shrink; None to leave it."""
     if len(stdout) < CAP_CHARS + 4 * MIN_SAVE_TOKENS + 200 or is_file_read(args.get("command")) or \
-            is_binary(stdout[:200_000]):
+            is_trimmed(args.get("command")) or is_binary(stdout[:200_000]):
         return None                                   # (+ the net win and the note: no copy saved just to delete it)
     text = stdout[:-1] if stdout.endswith("\n") else stdout
     total = text.count("\n") + 1

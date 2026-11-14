@@ -109,13 +109,32 @@ def unshown_line(s=None, mark=True):
             ". Look at what was added (`bigdad.py settle`, then `all`).") if parts else ""
 
 
+def _next_snapshot():
+    """Snapshots come from full baseline builds only (the in-between updates read just the new logs): say when the
+    next one is due, so 0 snapshots next to a working baseline is not read as a fault."""
+    try:
+        import time
+        import bd_baseline as B
+        b = B.load()
+        at = b.get("full_at") if b else None
+        if b and not b.get("watching") and isinstance(at, (int, float)) and not isinstance(at, bool):
+            due = time.strftime("%Y-%m-%d", time.localtime(at + B.refresh_days() * 86400))
+            return f"snapshots come from full baseline builds only; the next is due {due}"
+    except Exception:
+        pass
+    return "needs a baseline with new chats"
+
+
 def lines(s):
     out = []
     n = sum(1 for k in AREAS if k in s["settled"])
     due = "every area settled: drift check every %d days" % DRIFT_DAYS if all_settled(s) else "still moving: weekly checks"
     out.append(f"🥛 Big Dad settle · {n} of {len(AREAS)} settled · {len(s['history'])} snapshots · {due}")
     last = s["history"][-1] if s["history"] else {}
-    for k, (label, _, _) in AREAS.items():
+    empty = not s["history"] and not s["settled"]
+    if empty:
+        out.append(f"  no data   all {len(AREAS)} areas: {_next_snapshot()}")
+    for k, (label, _, _) in ([] if empty else AREAS.items()):
         st = s["settled"].get(k)
         if st:
             out.append(f"  settled   {label}: floor {_fmt(k, st['at'])} since {st['since'][:10]} "
@@ -125,7 +144,7 @@ def lines(s):
             was = f"{_fmt(k, prev)} -> " if prev is not None else ""
             out.append(f"  moving    {label}: {was}{_fmt(k, last[k])}: audit and cut here")
         else:
-            out.append(f"  no data   {label}: needs a baseline with new chats")
+            out.append(f"  no data   {label}: {_next_snapshot()}")
     for g in s.get("grew", [])[-3:]:
         if g.get("area") in AREAS:
             out.append(f"  grew back {AREAS[g['area']][0]}: {_fmt(g['area'], g['from'])} -> {_fmt(g['area'], g['to'])} "
