@@ -7,6 +7,13 @@ second read added to every later call. Headless only; cleans up after itself.
 """
 import json, os, shutil, subprocess, sys, tempfile
 
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "hooks")))
+try:
+    import bd_common as C  # noqa: E402  ODD_ROW, optional (bigdad.py's pattern)
+except ImportError:        # seventeenth review: works without bd_common, as bigdad.py does
+    C = None
+ODD_ROW = getattr(C, "ODD_ROW", Exception)   # a log row that cannot be read (bd_common; missing: any error)
+
 PROMPT = ("Use the Read tool on {f} (whole file, no offset or limit). Then call the Read tool on the "
           "exact same path again, whole file. If the second read is refused, do not retry it. "
           "Then reply with only: ok")
@@ -20,28 +27,46 @@ def sample_text(n=12_600):
     return "\n".join(lines)[:n]
 
 
+def _row(line, seen, ncalls):
+    """One stream-json line of deltas, read whole before anything is counted: (its call as a 0- or 1-item list, the
+    keys it adds to seen, the call index of each of its Reads). Raises on a value of the wrong kind."""
+    try:
+        r = json.loads(line)
+    except (ValueError, RecursionError):
+        return [], (), []
+    if not isinstance(r, dict) or r.get("type") != "assistant":   # 3.0.0: a non-object line is skipped
+        return [], (), []
+    msg = r.get("message") if isinstance(r.get("message"), dict) else {}   # a list/string: no message
+    u, mid = msg.get("usage") or {}, msg.get("id")
+    n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    new, call, rd = set(), [], []
+    if (mid is None or mid not in seen) and n:   # twenty-first review: an id-less call is never a duplicate
+        if mid is not None:
+            new.add(mid)
+        call.append(n)
+    for c in msg.get("content") or []:
+        if not isinstance(c, dict):
+            continue
+        key = ("read", mid, c.get("id"))
+        if c.get("type") == "tool_use" and c.get("name") == "Read" and not (
+                mid and c.get("id") and (key in seen or key in new)):
+            new.add(key)                                     # the same message streamed twice: count its Read once
+            rd.append(ncalls + len(call) - 1)
+    return call, new, rd
+
+
 def deltas(stream_lines):
     """From stream-json lines: input tokens per assistant call and the call index of each Read."""
     calls, reads = [], []
     seen = set()
     for line in stream_lines:
         try:
-            r = json.loads(line)
-        except ValueError:
-            continue
-        if r.get("type") != "assistant":
-            continue
-        msg = r.get("message") or {}
-        u, mid = msg.get("usage") or {}, msg.get("id")
-        n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-        if mid not in seen and n:
-            seen.add(mid)
-            calls.append(n)
-        for c in msg.get("content") or []:
-            key = ("read", mid, c.get("id")) if isinstance(c, dict) else None
-            if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") == "Read" and not (mid and c.get("id") and key in seen):
-                seen.add(key)                                # the same message streamed twice: count its Read once
-                reads.append(len(calls) - 1)
+            call, keys, rd = _row(line, seen, len(calls))
+        except ODD_ROW:
+            continue                                         # 3.0.0 fifteenth review: an odd row is skipped whole
+        seen.update(keys)                                    # only now is anything counted
+        calls.extend(call)
+        reads.extend(rd)
     if len(reads) < 2 or reads[1] + 1 >= len(calls):
         return calls, reads, None
     return calls, reads, calls[reads[1] + 1] - calls[reads[1]]

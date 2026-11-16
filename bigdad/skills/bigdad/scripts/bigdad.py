@@ -23,11 +23,16 @@ $CLAUDE_CONFIG_DIR), which record each request's shape and the token usage the A
   python bigdad.py health           security + upkeep checks on the setup (proposes, never changes)
   python bigdad.py fresh            setup snapshot + diff, changelog scan, retire-check vs native levers
   python bigdad.py proof read       the reread A/B: read guard off vs on, two tiny headless runs
-  python bigdad.py setup            tune Big Dad's own knobs to this machine -> profile.json (auto when stale)
+  python bigdad.py setup            tune Big Dad's own knobs to this machine -> profile.json (auto when stale);
+                                    runs no hook: launch cost from Claude Code's logs, else "not measured"
+  python bigdad.py setup --measure  the same, and runs each of your per-tool-call hook commands once with a
+                                    probe event to time it (only when you type it; network-looking ones skipped)
   python bigdad.py agents [HOURS]   subagents seen by the monitor hook: running + finished, model, size, flags
   python bigdad.py report           one self-contained local HTML page with the charts; prints its path
-  python bigdad.py receipt [session]  this chat's receipt: tokens sent, each compact before -> after
-                                     (in Claude Code, type receipt: shown at once, zero tokens)
+  python bigdad.py receipt [session]  this chat's short receipt: totals, plan limits, the last compact, the counts
+                                     --full  every line: each compact before -> after, tokens, agents
+                                     (in Claude Code, type receipt or receipt full: shown at once, zero tokens)
+                                     --color / --no-color; else colour on a terminal unless NO_COLOR
   python bigdad.py versus run [--runs 3] [--out DIR] [--transcript LOG] [--commit REV] [--cap TOKENS] [--root DIR]
                                     [--learning]  B left in its learning period (default: B acts)
                                     A/B: stock Claude Code vs the same + Big Dad (guild/versus-spec.md); costs real tokens
@@ -45,6 +50,9 @@ $CLAUDE_CONFIG_DIR), which record each request's shape and the token usage the A
   python bigdad.py shrink [on|off]  big noisy Bash output cut before it enters the chat (on by default);
                                     no argument: status + tokens cut so far, by command type
   python bigdad.py pause N|off      main-chat pause at N x the guide (off by default; interactive only)
+  python bigdad.py guide [N|auto]   this project's per-call cost guide (a guide, not a limit), e.g. `guide 300k`
+                                    for a project that runs a big window; writes only <project>/.claude/bigdad.json;
+                                    auto = back to your profile; BIGDAD_GUARD_AT still wins
   python bigdad.py helper-floor auto|off|4k  helpers: a re-read under the floor goes through (default auto:
                                     the helper's call size / its calls so far; off = deny every re-read)
   python bigdad.py agent-stop 100k|N|off  opt-in hard stop for subagents: 100k = tokens per call, 2 = 2x the
@@ -74,6 +82,7 @@ try:
 except ImportError:
     BC = None
 IMG_TOKENS = getattr(BC, "IMG_TOKENS", 1600)
+ODD_ROW = getattr(BC, "ODD_ROW", Exception)   # a log row that cannot be read (bd_common; missing: any error)
 REDACT = False
 ALIASES = {}
 try:
@@ -99,7 +108,7 @@ def rows(path, needle=None):
                 continue
             try:
                 r = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(r, dict):
                 yield r
@@ -134,6 +143,76 @@ def started(path):
     except OSError:
         pass
     return ""
+
+
+def shown_log(text):
+    """Text from a log, a file name or a state file as safe to print (thirty-sixth review, the one rule): bd_common.shown,
+    every control character as '?' so an escape sequence can't reach the terminal, non-ASCII kept; without bd_common,
+    printable ASCII only. Not a str: ''."""
+    if BC is not None:
+        return BC.shown(text)
+    return "".join(c if " " <= c <= "~" else "?" for c in text) if isinstance(text, str) else ""
+
+
+def shown_label(text):
+    """A name where a row or list expects one (thirty-seventh review): bd_common.label, shown_log or '?' when that is
+    empty or not a str; without bd_common, shown_log's fallback or '?'. (Not called `label`: reread and print_load
+    have a local of that name.)"""
+    return BC.label(text) if BC is not None else (shown_log(text) or "?")
+
+
+# thirty-seventh review: a log field used as a dict key, in os.path, sliced or formatted with a width goes through
+# dstr first (a str, else ''), so a field of the wrong type reads as missing and the row still counts
+dstr = BC.dstr if BC is not None else (lambda v: v if isinstance(v, str) else "")
+
+
+# thirty-seventh review, part 3: a row part that is not a dict reads as {} (missing) where .get is called on it, one
+# that is not a list as [] (no entries) where it is iterated, and a token count through bd_common.sane (an int from 0
+# to 10**12, not a bool; a str, None, list, NaN or huge count reads as 0); without bd_common, the same small rule
+def ddict(v):
+    return v if isinstance(v, dict) else {}
+
+
+def dlist(v):
+    return v if isinstance(v, list) else []
+
+
+def count(v):
+    if BC is not None:
+        return BC.sane(v, 0, whole=True)
+    return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 10 ** 12 else 0
+
+
+def count_ok(v):
+    """True when count() keeps v as it is (thirty-eighth review: the check for a count read back from a cache)."""
+    return type(v) is int and count(v) == v      # thirty-ninth review: the rule stated once
+
+
+def safe_out(text):
+    """The net at the door (thirty-seventh review): bd_common.safe_out, '\\n' and Big Dad's own SGR colours kept, every
+    other control character as '?'; without bd_common, as shown_log falls back: printable ASCII, '\\n' and SGR only."""
+    if BC is not None:
+        return BC.safe_out(text)
+    return re.sub("\033\\[[0-9;]*m|[^ -~\n]", lambda m: m.group() if len(m.group()) > 1 else "?", text)
+
+
+class SafeOut:
+    """sys.stdout / sys.stderr for the life of a command (thirty-seventh review): each write() goes through safe_out on
+    its own (a sequence split over two writes shows its ESC as '?'), so no print site can send a live control
+    character; everything else (flush, encoding, isatty, fileno, buffer, reconfigure) is the wrapped stream's."""
+
+    def __init__(self, out):
+        self._out = out
+
+    def write(self, s):
+        return self._out.write(safe_out(s) if isinstance(s, str) else s)
+
+    def writelines(self, lines):
+        for s in lines:
+            self.write(s)
+
+    def __getattr__(self, name):
+        return getattr(self._out, name)
 
 
 def alias(raw):
@@ -174,21 +253,23 @@ def est_tokens(body):
         return BC.est_tokens(body)
     if isinstance(body, list):
         imgs = sum(1 for b in body if isinstance(b, dict) and b.get("type") == "image")
-        text = sum(len(b.get("text") or "") for b in body if isinstance(b, dict) and b.get("type") == "text")
+        # thirty-seventh review, part 3: a text that is not a str is size 0 (a number raised in len)
+        text = sum(len(dstr(b.get("text"))) for b in body if isinstance(b, dict) and b.get("type") == "text")
         return imgs * IMG_TOKENS + text // 4, "image" if imgs else "text"
     return len(body if isinstance(body, str) else json.dumps(body)) // 4, "text"
 
 
 def print_load(label, total, parts, detail, top=5):
     chars = sum(parts.values()) or 1
-    print(f"🥛 == LOAD before the first message  [{label}]")
+    # thirty-sixth review: the label, row names and sub-rows (tool, skill, hook names, paths) printed safely
+    print(f"🥛 == LOAD before the first message  [{shown_log(label)}]")
     print(f"  {total:,} input tokens on call 1 (measured). Rows split that by size:")
     for name, n in parts.most_common():
-        print(f"  {total*n/chars:>8,.0f}  {name}")
+        print(f"  {total*n/chars:>8,.0f}  {shown_log(name)}")
         for sub, m in detail[name].most_common(top):
             if name.startswith("CLAUDE.md"):
-                sub = os.path.basename(sub)
-            print(f"  {'':>8}    {total*m/chars:>7,.0f}  {sub}")
+                sub = os.path.basename(dstr(sub))   # thirty-seventh review: a str by now (load_parts); dstr all the same
+            print(f"  {'':>8}    {total*m/chars:>7,.0f}  {shown_label(sub)}")   # thirty-seventh review: a name, '?' if blank
 
 
 # ------------------------------------------------------------------ Claude Code
@@ -199,10 +280,10 @@ class Claude:
         self.proj = os.path.join(CLAUDE_DIR, "projects")
 
     def present(self):
-        return bool(glob.glob(os.path.join(self.proj, "*", "*.jsonl")))
+        return bool(glob.glob(os.path.join(glob.escape(self.proj), "*", "*.jsonl")))   # escaped: as bd_agents
 
     def sessions(self):
-        return newest(os.path.join(self.proj, "*", "*.jsonl"))
+        return newest(os.path.join(glob.escape(self.proj), "*", "*.jsonl"))
 
     def raw_id(self, p):
         return os.path.basename(p)[:8]
@@ -212,7 +293,7 @@ class Claude:
 
     @staticmethod
     def subagent_logs(p):
-        return glob.glob(os.path.join(p[:-6], "subagents", "*.jsonl"))
+        return glob.glob(os.path.join(glob.escape(p[:-6]), "subagents", "*.jsonl"))
 
     @staticmethod
     def walk(path):
@@ -221,33 +302,44 @@ class Claude:
         date = ""
         for r in rows(path):
             t = r.get("type")
-            date = date or (r.get("timestamp") or "")[:10]
-            if t == "system" and "compact" in str(r.get("subtype", "")):
+            date = date or dstr(r.get("timestamp"))[:10]     # thirty-seventh review: a number ts raised on the slice
+            # thirty-seventh review, part 3: a subtype that is not a str reads as missing (str(["compact"]) was one)
+            if t == "system" and "compact" in dstr(r.get("subtype")):
                 comp.append(len(calls))
                 continue
-            m = r.get("message") or {}
+            m = ddict(r.get("message"))          # thirty-seventh review, part 3: not a dict reads as missing
             if t == "assistant":
-                u, mid = m.get("usage") or {}, m.get("id")
-                if u and mid not in seen:
-                    seen.add(mid)
-                    new = (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
-                    old = u.get("cache_read_input_tokens") or 0
+                # thirty-seventh review: an id that is not a str (a list raised in the set) reads as no id
+                u, mid = ddict(m.get("usage")), (m.get("id") if isinstance(m.get("id"), str) else None)
+                if u and (mid is None or mid not in seen):   # 3.0.0 twenty-first review: no id, never a duplicate
+                    # thirty-seventh review, part 3: a count that is a str, None, bool, list, NaN or huge reads as 0
+                    new = count(u.get("input_tokens")) + count(u.get("cache_creation_input_tokens"))
+                    old = count(u.get("cache_read_input_tokens"))
                     if new + old:
-                        calls.append((new, old, u.get("output_tokens") or 0))
-                for c in m.get("content") or []:
+                        # thirty-ninth review: the id is marked only when the row is kept, so a damaged first
+                        # block (counts read as 0) no longer hides the good block of the same id
+                        if mid is not None:
+                            seen.add(mid)
+                        calls.append((new, old, count(u.get("output_tokens"))))
+                for c in dlist(m.get("content")):    # thirty-seventh review, part 3: a str or number content: no blocks
                     if isinstance(c, dict) and c.get("type") == "tool_use":
-                        inp = c.get("input") or {}
-                        key = inp.get("file_path") or inp.get("command") or inp.get("pattern") or inp.get("url") or ""
-                        names[c.get("id")] = (c.get("name") or "?", str(key), (inp.get("offset"), inp.get("limit")))
+                        inp = ddict(c.get("input"))
+                        # thirty-seventh review, part 3: the first of these that is a str (a list path was str()-ed)
+                        key = (dstr(inp.get("file_path")) or dstr(inp.get("command")) or dstr(inp.get("pattern"))
+                               or dstr(inp.get("url")))
+                        # thirty-seventh review: the id, name and range are keys and sort fields: a value of the
+                        # wrong type reads as missing (a list id or offset raised "unhashable", a number name in sort)
+                        rng = tuple(v if isinstance(v, (int, float)) else None for v in (inp.get("offset"), inp.get("limit")))
+                        names[dstr(c.get("id"))] = (dstr(c.get("name")) or "?", key, rng)
             elif t == "user" and isinstance(m.get("content"), list):
                 for c in m["content"]:
                     if isinstance(c, dict) and c.get("type") == "tool_result":
-                        tid = c.get("tool_use_id")
+                        tid = dstr(c.get("tool_use_id"))
                         if tid and tid in got:               # the same result logged twice: count it once
                             continue
                         got.add(tid)
                         tok, kind = est_tokens(c.get("content"))
-                        nm, key, rng = names.get(c.get("tool_use_id"), ("?", "", None))
+                        nm, key, rng = names.get(tid, ("?", "", None))
                         results.append((len(calls), tok, kind, nm, key, rng))
         return {"calls": calls, "comp": comp, "results": results, "date": date}
 
@@ -255,13 +347,16 @@ class Claude:
         shape, atts = None, []
         for r in rows(path):
             t = r.get("type")
-            if t == "api-request-shape" and shape is None:
+            # thirty-ninth review: only a dict shape is taken (as _mode_row and cmd_tools): a list or str shape no
+            # longer hides a later good one
+            if t == "api-request-shape" and shape is None and isinstance(r.get("shape"), dict):
                 shape = r.get("shape")
             elif t == "attachment":
-                atts.append(r.get("attachment") or {})
+                atts.append(ddict(r.get("attachment")))   # thirty-seventh review, part 3: not a dict reads as {}
             elif t == "assistant":
-                u = (r.get("message") or {}).get("usage") or {}
-                total = sum(u.get(f) or 0 for f in ("input_tokens",
+                u = ddict(ddict(r.get("message")).get("usage"))
+                # thirty-seventh review, part 3: a count of the wrong type, NaN or huge reads as 0 (a str raised in sum)
+                total = sum(count(u.get(f)) for f in ("input_tokens",
                             "cache_creation_input_tokens", "cache_read_input_tokens"))
                 if total:
                     return shape, atts, total
@@ -272,34 +367,41 @@ class Claude:
         if not total:
             return None
         parts, detail = Counter(), defaultdict(Counter)
+        shape = ddict(shape)        # thirty-seventh review, part 3: a shape, tools list or tool of the wrong type: missing
         if shape:
             parts["system prompt"] = len(json.dumps(shape.get("system", [])))
-            for tool in shape.get("tools", []):
+            for tool in dlist(shape.get("tools")):
                 n = len(json.dumps(tool))
                 parts["tool schemas"] += n
-                detail["tool schemas"][tool.get("name", "?")] = n
+                # thirty-seventh review: names and paths below are dict keys: a non-str one reads as missing ('?')
+                detail["tool schemas"][dstr(ddict(tool).get("name")) or "?"] = n
         for a in atts:
-            ty = a.get("type", "?")
+            ty = dstr(a.get("type")) or "?"
             if ty == "deferred_tools_delta":
-                for line in a.get("addedLines") or []:
+                # thirty-seventh review, part 3: addedLines not a list reads as empty; an entry not a str is skipped
+                for line in dlist(a.get("addedLines")):
+                    if not isinstance(line, str):
+                        continue
                     m = re.match(r"mcp__(.+?)__", line)
                     grp = "MCP " + m.group(1) if m else "built-in"
                     parts["deferred tool names"] += len(line) + 1
                     detail["deferred tool names"][grp] += len(line) + 1
             elif ty == "skill_listing":
-                body = a.get("content") or ""
+                body = dstr(a.get("content"))      # thirty-seventh review, part 3: not a str reads as '' (size 0)
                 parts["skill list"] += len(body)
                 for line in body.split("\n- "):
                     detail["skill list"][line.lstrip("- ").split(": ", 1)[0]] += len(line)
             elif ty == "instructions":
-                for f in a.get("files") or []:
-                    n = len(f.get("content") or "")
+                for f in dlist(a.get("files")):
+                    if not isinstance(f, dict):       # thirty-seventh review, part 3: a file entry not a dict: skipped
+                        continue
+                    n = len(dstr(f.get("content")))   # thirty-seventh review, part 3: a number content is size 0
                     parts["CLAUDE.md + memory"] += n
-                    detail["CLAUDE.md + memory"][f.get("path", "?")] = n
+                    detail["CLAUDE.md + memory"][dstr(f.get("path")) or "?"] = n
             elif ty == "hook_success":
-                n = len(a.get("content") or "")
+                n = len(dstr(a.get("content")))        # thirty-seventh review, part 3: not a str is size 0
                 parts["hook output"] += n
-                detail["hook output"][a.get("hookName", "?")] += n
+                detail["hook output"][dstr(a.get("hookName")) or "?"] += n
             elif ty in ("prompt_snapshot", "remote_session_change"):
                 continue  # log-only copies, not sent to the model
             elif ty in ("agent_listing_delta", "mcp_instructions_delta"):
@@ -326,7 +428,8 @@ class Claude:
             sent = sum(a + b for a, b, _ in calls)
             sub = sum(sum(a + b for a, b, _ in self.walk(sp)["calls"]) for sp in self.subagent_logs(p))
             peak = max((a + b for a, b, _ in calls), default=0)
-            print(f"  {self.sid(p):<8}  {w['date']:10}  {len(calls):>5}  {big(sent):>8}  {k(sum(c[2] for c in calls)):>7}"
+            # thirty-sixth review: the id (a file name) and the date (a log timestamp) printed safely
+            print(f"  {shown_log(self.sid(p)):<8}  {shown_log(w['date']):10}  {len(calls):>5}  {big(sent):>8}  {k(sum(c[2] for c in calls)):>7}"
                   f"  {big(sub):>9}  {k(peak):>10}  {k(sent // max(len(calls), 1)):>9}")
 
     def reread(self, n):
@@ -377,45 +480,47 @@ class Claude:
         print("  heaviest sessions:")
         print("    session    date        calls  compacts      sent   re-sent   peak/call   subagents")
         for i, (s, sid_, (nc, ncomp, peak, date), so, ss) in enumerate(sorted(per, reverse=True)[:6], 1):
-            print(f"    {sid_:<9}  {date:10}  {nc:>5}  {ncomp:>8}  {big(s):>8}  {so/max(s,1):>7.0%}"
+            print(f"    {shown_log(sid_):<9}  {shown_log(date):10}  {nc:>5}  {ncomp:>8}  {big(s):>8}  {so/max(s,1):>7.0%}"
                   f"  {k(peak):>10}  {big(ss):>10}")
         total_carry = sum(c[0] for c in carried)
         print(f"  tool results kept in context and re-sent on later calls: ≈{big(total_carry)} tokens.")
         print("  heaviest single results (≈ size x later calls" + (")" if REDACT else "; * = subagent):"))
         for cost, tok, ncalls, label, nm, kind, key in sorted(carried, reverse=True)[:8]:
-            label = who(label)
-            what = nm + (" image" if kind == "image" else "")
-            arg = shown_arg(nm, key)
+            label = shown_log(who(label))       # thirty-sixth review: label, tool name and what it touched, safely
+            what = shown_label(nm) + (" image" if kind == "image" else "")   # thirty-seventh review: '?' if blank
+            arg = shown_log(shown_arg(nm, key))
             print(f"    ≈{big(cost):>7}  {k(tok):>7} x {ncalls:>4} calls  {label:<9}  {what:<12} {arg}")
         rep = sum(r[0] for r in repeats)
         print(f"  same file + range read again while the first copy was still in context:"
               f" {len(repeats)} times, ≈{big(rep)} tokens.")
         for cost, tok, label, key in sorted(repeats, reverse=True)[:3]:
-            print(f"    ≈{big(cost):>7}  {who(label):<9}  {shown_arg('Read', key)}")
+            print(f"    ≈{big(cost):>7}  {shown_log(who(label)):<9}  {shown_log(shown_arg('Read', key))}")
 
     def skills(self):
         listed, src = {}, ""
-        logs = sorted(glob.glob(os.path.join(self.proj, "**", "*.jsonl"), recursive=True), key=started, reverse=True)
+        logs = sorted(glob.glob(os.path.join(glob.escape(self.proj), "**", "*.jsonl"), recursive=True), key=started, reverse=True)
         for p in logs[:300]:
             src = "newest-started log with a skill list, " + started(p)[:16].replace("T", " ") + " UTC"
             for r in rows(p, "skill_listing"):
-                a = r.get("attachment") or {}
+                a = ddict(r.get("attachment"))     # thirty-seventh review, part 3: not a dict reads as {}
                 if a.get("type") == "skill_listing" and a.get("isInitial"):
-                    for line in (a.get("content") or "").split("\n- "):
+                    for line in dstr(a.get("content")).split("\n- "):   # not a str reads as ''
                         name, _, desc = line.lstrip("- ").partition(": ")
+                        if not name:      # thirty-seventh review, part 3: no blank skill (it ended the search early)
+                            continue
                         listed[name] = len(line)
                         SKILL_DESC[name] = desc[:200]
             if listed:
                 break
         used, mcp = Counter(), Counter()
-        files = glob.glob(os.path.join(self.proj, "**", "*.jsonl"), recursive=True)
+        files = glob.glob(os.path.join(glob.escape(self.proj), "**", "*.jsonl"), recursive=True)
         # per-file usage counts, keyed by size+mtime: a closed log never changes, so only new/grown logs are read again
         cache_path = os.path.join(CLAUDE_DIR, "bigdad", "usage-cache.json")
         try:
             with _open(cache_path, encoding="utf-8", errors="replace") as f:
                 cache = json.load(f)
             cache = cache if isinstance(cache, dict) else {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             cache = {}
         fresh, dirty = {}, False
         for p in files:
@@ -425,7 +530,11 @@ class Claude:
                 continue
             key, stamp = p.replace("\\", "/"), [st.st_size, int(st.st_mtime)]
             hit = cache.get(key)
-            if hit and hit[:2] == stamp:
+            # thirty-seventh review: an entry is used only in the shape written below ([size, mtime, {name: n},
+            # {server: n}]); any other (5 raised on the slice, a str count in update) reads as missing: scanned again
+            # thirty-eighth review: and each count by the count rule (an int, not a bool, 0..10**12); True or -5 was taken
+            if (isinstance(hit, list) and len(hit) == 4 and hit[:2] == stamp
+                    and all(isinstance(d, dict) and all(count_ok(v) for v in d.values()) for d in hit[2:])):
                 fresh[key] = hit
             else:
                 u, m = scan_usage(p)
@@ -447,7 +556,7 @@ class Claude:
         keep = __import__("bd_keep")
         kept_all = keep.items()
         print("  MCP tool calls per server, all logs (check before cutting a server):",
-              ", ".join(f"{n} {c}" + (" (kept, your choice)" if keep.match(n, "mcp", kept_all) else "")
+              ", ".join(f"{shown_label(n)} {c}" + (" (kept, your choice)" if keep.match(n, "mcp", kept_all) else "")
                         for n, c in mcp.most_common()) or "none")
         print("  cut levers: claude.ai connectors toggle at claude.ai; local servers via `disabledMcpServers` or /mcp;"
               " ENABLE_TOOL_SEARCH keeps only names in context (default on).")
@@ -498,24 +607,26 @@ def report_skills(agent, listed, used, nfiles, src="", days=None):
     kept = [n for n in listed if keep.match(n, "skill", kept_all) or keep.match(n, "plugin", kept_all)]
     never = sorted((n for n in listed if not used[n] and n not in kept), key=lambda n: -listed[n])
     span = f" over {days:.0f} days" if days is not None else ""
-    print(f"🥛 == SKILLS [{agent}] {len(listed)} listed ({src}); usage from {nfiles} logs{span}")
+    # thirty-sixth review: skill names (from a log's skill list) and the source line printed safely; thirty-seventh
+    # review: the names through shown_label, so a blank one shows as '?'
+    print(f"🥛 == SKILLS [{agent}] {len(listed)} listed ({shown_log(src)}); usage from {nfiles} logs{span}")
     print("  Big Dad never deletes a skill: every option below is reversible and waits for your yes.")
     own = [n for n in listed if n != "bigdad" and not n.startswith("bigdad:") and OVERLAP.search(n + " " + SKILL_DESC.get(n, ""))]
     if own:
         print("  your skills that already cover part of this job (Big Dad points to them instead of duplicating them):")
-        print("    " + ", ".join(f"{n} ({used[n]} uses)" for n in sorted(own, key=lambda n: -used[n])[:8]))
+        print("    " + ", ".join(f"{shown_label(n)} ({used[n]} uses)" for n in sorted(own, key=lambda n: -used[n])[:8]))
     print("  (config cuts show up only in sessions started after the cut)")
-    hits = [f"{n} {used[n]}" for n in sorted(listed, key=lambda n: -used[n]) if used[n]]
+    hits = [f"{shown_label(n)} {used[n]}" for n in sorted(listed, key=lambda n: -used[n]) if used[n]]
     print("  used:", ", ".join(hits) or "none")
     ch = sum(listed[n] for n in never)
     print(f"  never used: {len(never)} (≈{ch // 4:,} tokens of listing on every call)")
     if kept:
         print(f"  kept by you: {len(kept)} (≈{sum(listed[n] for n in kept) // 4:,} tokens of listing per call, your choice;"
-              " never a cut): " + ", ".join(sorted(kept, key=lambda n: -listed[n])))
+              " never a cut): " + ", ".join(shown_label(n) for n in sorted(kept, key=lambda n: -listed[n])))
     if days is not None and days < HISTORY_DAYS:
         if never:
             top = never[:8]
-            print(f"    biggest never used: " + ", ".join(f"{n} (≈{listed[n] // 4:,})" for n in top)
+            print(f"    biggest never used: " + ", ".join(f"{shown_label(n)} (≈{listed[n] // 4:,})" for n in top)
                   + (f", +{len(never) - len(top)} more" if len(never) > len(top) else "") + ". Names only, not a cut.")
         print(f"    only {days:.0f} days of logs (under {HISTORY_DAYS}): no skill cut suggested yet. A skill unused for a few days")
         print("    may still be one you rely on. Run `skills` again later.")
@@ -525,13 +636,13 @@ def report_skills(agent, listed, used, nfiles, src="", days=None):
     plug = [n for n in never if ":" in n]
     rest = [n for n in never if n not in mine and n not in plug]
     if mine:
-        print(f"    yours ({len(mine)}, ≈{sum(listed[n] for n in mine) // 4:,} tokens):", ", ".join(mine))
+        print(f"    yours ({len(mine)}, ≈{sum(listed[n] for n in mine) // 4:,} tokens):", ", ".join(map(shown_label, mine)))
         print("      native lever first: `disable-model-invocation: true` in SKILL.md keeps /name but drops it from the list;")
         print("      `skillOverrides` (settings) can set user-invocable-only or off per skill. Last resort: move to ~/.claude/skills-off.")
     if plug:
-        print(f"    from plugins ({len(plug)}; skillOverrides doesn't reach these): turn the plugin off after checking its used skills:", ", ".join(plug))
+        print(f"    from plugins ({len(plug)}; skillOverrides doesn't reach these): turn the plugin off after checking its used skills:", ", ".join(map(shown_label, plug)))
     if rest:
-        print(f"    built in, can't be cut here ({len(rest)}):", ", ".join(rest))
+        print(f"    built in, can't be cut here ({len(rest)}):", ", ".join(map(shown_label, rest)))
 
 
 def cmd_files():
@@ -549,9 +660,9 @@ def cmd_files():
         print("  none found")
     for size, fp in sorted(hits, reverse=True)[:20]:
         if REDACT:   # size, name and depth only: folder names can name projects and people
-            print(f"  {size:>7,}  {os.path.basename(fp)}  (depth {fp[len(HOME):].count(os.sep)} under ~)")
+            print(f"  {size:>7,}  {shown_log(os.path.basename(fp))}  (depth {fp[len(HOME):].count(os.sep)} under ~)")
         else:
-            print(f"  {size:>7,}  {fp}")
+            print(f"  {size:>7,}  {shown_log(fp)}")   # thirty-sixth review: a path from the disk, printed safely
     dup = defaultdict(list)
     for _, fp in hits:
         try:
@@ -560,8 +671,8 @@ def cmd_files():
             pass
     for text, fps in dup.items():
         if len(fps) > 1 and text.strip():
-            print(f"  identical text in {len(fps)} files" + ("" if REDACT else ": " + " | ".join(fps)))
-    mem = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", "memory", "*.md"))
+            print(f"  identical text in {len(fps)} files" + ("" if REDACT else ": " + " | ".join(map(shown_log, fps))))
+    mem = glob.glob(os.path.join(glob.escape(CLAUDE_DIR), "projects", "*", "memory", "*.md"))
     if mem:
         print(f"  claude memory files: {len(mem)} ({sum(map(os.path.getsize, mem)):,} bytes;"
               " only each MEMORY.md index loads at start)")
@@ -622,8 +733,19 @@ class Redact:
             s = p.sub("<private>", s)
         return self.out.write(s)
 
+    def writelines(self, lines):
+        for s in lines:              # thirty-eighth review: each through write, so none passes the redaction
+            self.write(s)
+
     def flush(self):
         self.out.flush()
+
+    def __getattr__(self, name):
+        # thirty-eighth review: everything else (isatty, fileno, encoding, buffer, reconfigure) is the wrapped
+        # stream's, as SafeOut does; with --redact the colour on a TTY and a flush=True print were lost
+        if name == "out":
+            raise AttributeError(name)
+        return getattr(self.out, name)
 
 
 def mode_of(path, entry):
@@ -636,10 +758,44 @@ def mode_of(path, entry):
     return "headless (-p / SDK)" if entry and entry != "cli" else "interactive"
 
 
+def _mode_row(line, shape_open, first_open, seen):
+    """One log line of cmd_modes, read whole before anything is counted: (what, value) with what one of "shape"
+    ((tool count, system chars)), "skill" (skill list chars), "instr", "call" ((id, input, cache read)), or
+    (None, None). Raises on a value of the wrong kind (a list "shape", a string "attachment", a list "id"...)."""
+    try:
+        r = json.loads(line)
+    except (ValueError, RecursionError):
+        return None, None
+    if not isinstance(r, dict):                  # 3.0.0 fourteenth review: a non-object line is skipped
+        return None, None
+    t = r.get("type")
+    if t == "api-request-shape" and shape_open:
+        sh = r.get("shape")
+        if not isinstance(sh, dict):             # thirty-eighth review: a shape that is not a dict: keep looking
+            return None, None
+        return "shape", (len(dlist(sh.get("tools"))), len(json.dumps(sh.get("system", []))))
+    if t == "attachment" and first_open:
+        a = ddict(r.get("attachment"))           # thirty-eighth review: not a dict reads as {} (missing)
+        if a.get("type") == "skill_listing":
+            return "skill", len(dstr(a.get("content")))
+        return ("instr", None) if a.get("type") == "instructions" else (None, None)   # its value is never read
+    if t == "assistant":
+        msg = ddict(r.get("message"))            # a list/string: none
+        u, mid = ddict(msg.get("usage")), msg.get("id")
+        mid = mid if isinstance(mid, str) else None   # thirty-eighth review: an id that is not a str: no id
+        if not u or (mid is not None and mid in seen):   # twenty-first review: no id is never a duplicate
+            return None, None
+        # thirty-eighth review: each count through count() as walk does: a str, bool, NaN, Infinity, 1e400 or huge
+        # count reads as 0 (a NaN or Infinity raised in int(median) at the end)
+        n = sum(count(u.get(k)) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        return "call", (mid, n, count(u.get("cache_read_input_tokens")))
+    return None, None
+
+
 def cmd_modes(agent):
     """Per execution mode: share of tokens, startup load, repeated context, and what the
     logged startup request contained. Everything is read from the logs (verified)."""
-    files = glob.glob(os.path.join(agent.proj, "**", "*.jsonl"), recursive=True)
+    files = glob.glob(os.path.join(glob.escape(agent.proj), "**", "*.jsonl"), recursive=True)
     keys = ("logs", "calls", "sent", "cached", "instr")
     S = defaultdict(lambda: {**{k: 0 for k in keys}, "first": [], "tools": [], "system": [], "skills": []})
     for p in files:
@@ -653,35 +809,33 @@ def cmd_modes(agent):
                 if not any(n in line for n in ('"usage"', "api-request-shape", '"attachment"')):
                     continue
                 try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                t = r.get("type")
-                if t == "api-request-shape" and shape is None:
-                    shape = r.get("shape") or {}
-                elif t == "attachment" and first is None:
-                    a = r.get("attachment") or {}
-                    if a.get("type") == "skill_listing":
-                        skill += len(a.get("content") or "")
-                    elif a.get("type") == "instructions":
-                        instr = True
-                elif t == "assistant":
-                    msg = r.get("message") or {}
-                    u, mid = msg.get("usage") or {}, msg.get("id")
-                    if not u or mid in seen:
-                        continue
-                    seen.add(mid)
-                    n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+                    what, v = _mode_row(line, shape is None, first is None, seen)
+                except ODD_ROW:
+                    continue                         # 3.0.0 fifteenth review: a row that cannot be read: skipped whole
+                except RecursionError:
+                    continue                         # nineteenth review: a row too deep for json.dumps, skipped too
+                if what == "shape":                  # only now is anything counted
+                    shape = v
+                elif what == "skill":
+                    skill += v
+                elif what == "instr":
+                    instr = True
+                elif what == "call":
+                    mid, n, c = v
                     if n:
-                        calls, sent, cached = calls + 1, sent + n, cached + (u.get("cache_read_input_tokens") or 0)
+                        # thirty-ninth review: the id is marked only when the row is kept (bd_baseline.calls' rule),
+                        # so a damaged first block (counts read as 0) no longer hides the good block of the same id
+                        if mid is not None:          # twenty-first review: None is never added to seen
+                            seen.add(mid)
+                        calls, sent, cached = calls + 1, sent + n, cached + c
                         first = first or n
         if not calls:
             continue
         s = S[mode_of(p, entry)]
         s["logs"] += 1; s["calls"] += calls; s["sent"] += sent; s["cached"] += cached; s["instr"] += instr
         s["first"].append(first); s["skills"].append(skill)
-        if shape is not None:
-            s["tools"].append(len(shape.get("tools", []))); s["system"].append(len(json.dumps(shape.get("system", []))))
+        if shape is not None:                        # (tools, system chars), measured when its row was read
+            s["tools"].append(shape[0]); s["system"].append(shape[1])
     total = sum(s["sent"] for s in S.values())
     print(f"🥛 == MODES [claude] {sum(s['logs'] for s in S.values())} logs, {big(total)} input tokens (verified: API usage + logged request shapes)")
     if not total:
@@ -704,7 +858,7 @@ def cmd_tools(agent, n=2):
     tools that request carried (sizes ≈ JSON chars / 4). Run it before and after a cut: the
     newer rows show the cut in that mode. This is how to prove a cut for interactive sessions
     and agents, which a headless probe can't (they load tools differently)."""
-    files = sorted(glob.glob(os.path.join(agent.proj, "**", "*.jsonl"), recursive=True), key=started, reverse=True)
+    files = sorted(glob.glob(os.path.join(glob.escape(agent.proj), "**", "*.jsonl"), recursive=True), key=started, reverse=True)
     shown = Counter()
     print(f"🥛 == TOOLS [claude] newest-started {n} logs per mode (UTC start): first call (verified) and the tools it carried (≈ size)")
     for p in files:
@@ -716,27 +870,37 @@ def cmd_tools(agent, n=2):
                 if entry is None and '"entrypoint"' in line:
                     m = re.search(r'"entrypoint":\s*"([^"]+)"', line)
                     entry = m.group(1) if m else None
+                took, r = False, None
                 if shape is None and "api-request-shape" in line:
                     try:
-                        shape = json.loads(line).get("shape") or {}
-                    except ValueError:
-                        pass
-                elif first is None and '"usage"' in line:
-                    try:
-                        u = (json.loads(line).get("message") or {}).get("usage") or {}
-                    except ValueError:
-                        continue
-                    first = sum(u.get(x) or 0 for x in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")) or None
+                        r = ddict(json.loads(line))
+                    except (ValueError, RecursionError):
+                        r = {}
+                    # thirty-eighth review: only a row of that type with a dict shape, as cmd_modes and first_call
+                    # read it; a row that merely quotes the text (or an odd shape) no longer sets {} for good
+                    if r.get("type") == "api-request-shape" and isinstance(r.get("shape"), dict):
+                        shape, took = r["shape"], True
+                if not took and first is None and '"usage"' in line:
+                    if r is None:                    # thirty-ninth review: a line already parsed above is reused
+                        try:
+                            r = ddict(json.loads(line))
+                        except (ValueError, RecursionError):
+                            continue
+                    u = ddict(ddict(r.get("message")).get("usage"))
+                    # thirty-seventh review, part 3: a count of the wrong type, NaN or huge reads as 0
+                    first = sum(count(u.get(x)) for x in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")) or None
                 if shape is not None and first:
                     break
         mode = mode_of(p, entry)
         if shape is None or not first or shown[mode] >= n:
             continue
         shown[mode] += 1
-        tools = sorted(((len(json.dumps(t)) // 4, t.get("name", "?")) for t in shape.get("tools", [])), reverse=True)
-        when = started(p)[:16].replace("T", " ") or "?"
+        # thirty-seventh review: a name that is not a str reads as '?' (123 next to a str one raised in the sort)
+        # thirty-seventh review, part 3: a tools list or a tool of the wrong type reads as missing (no tools, name '?')
+        tools = sorted(((len(json.dumps(t)) // 4, dstr(ddict(t).get("name")) or "?") for t in dlist(shape.get("tools"))), reverse=True)
+        when = shown_log(started(p)[:16].replace("T", " ")) or "?"   # thirty-sixth review: log text, printed safely
         print(f"  {mode:<20} {when}  first call {first:>7,}  tools {len(tools):>2} ≈{k(sum(t for t, _ in tools)):>6}"
-              f"  biggest: " + ", ".join(f"{name} {k(t)}" for t, name in tools[:5]))
+              f"  biggest: " + ", ".join(f"{shown_label(name)} {k(t)}" for t, name in tools[:5]))
     if not shown:
         print("  no logged request shapes yet")
 
@@ -775,7 +939,7 @@ def cmd_notes(n=40):
             for l in f:
                 try:
                     d = json.loads(l)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if isinstance(d, dict):
                     rows.append(d)
@@ -789,47 +953,123 @@ def cmd_notes(n=40):
     if big:
         by = {}
         for r in big:
-            t = by.setdefault(str(r.get("tool", "?")), [0, 0])
-            t[0] += 1; t[1] += r.get("tokens") if isinstance(r.get("tokens"), (int, float)) else 0
+            # thirty-seventh review: a tool (and below an agent type) that is not a str reads as '?', not str(5)
+            t = by.setdefault(dstr(r.get("tool")) or "?", [0, 0])
+            t[0] += 1; t[1] += count(r.get("tokens"))   # thirty-seventh review, part 3: a bool, NaN or huge count is 0
         prev = sum(1 for r in big if r.get("kept_chars"))
         print("  Big outputs, by what the model kept (until /compact each rides along on every later call;")
         print(f"  Bash outputs over ~30k chars count as their ~2k-char preview: {prev} such). `reread` has the re-sent total:")
         for tool, (k, tok) in sorted(by.items(), key=lambda x: -x[1][1]):
-            print(f"    {tool:<12} {k:>3} x  ~{tok:,} tokens")
+            print(f"    {shown_label(tool):<12} {k:>3} x  ~{tok:,} tokens")   # thirty-sixth review: notes text, safely
         sub = {}
         for r in big:
             if r.get("agent"):
-                t = sub.setdefault(str(r.get("agent_type") or "?"), [0, 0])
-                t[0] += 1; t[1] += r.get("tokens") if isinstance(r.get("tokens"), (int, float)) else 0
+                t = sub.setdefault(dstr(r.get("agent_type")) or "?", [0, 0])
+                t[0] += 1; t[1] += count(r.get("tokens"))
         if sub:
             print("  of which in subagents (each rides along in that agent's own calls):")
             for kind, (k, tok) in sorted(sub.items(), key=lambda x: -x[1][1]):
-                print(f"    {kind[:24]:<24} {k:>3} x  ~{tok:,} tokens")
+                print(f"    {shown_label(kind[:24]):<24} {k:>3} x  ~{tok:,} tokens")
     if agent:
         print("  Agent notes (newest last):")
         for r in agent[-n:]:
-            ts = str(r.get("ts") or "?")[:16].replace("T", " ")
-            print(f"    {ts}  {r.get('text', '')}")
+            ts = shown_log(str(r.get("ts") or "?")[:16].replace("T", " "))
+            print(f"    {ts}  {shown_log(str(r.get('text', '')))}")   # a newline in a note shows as '?' too
     print("  Turn a note into a change only with the user's yes; then prove it and measure again.")
 
 
+GUIDE_MIN, GUIDE_MAX = 10_000, 1_000_000       # autoCompactWindow's own range tops out at 1M
+
+
+def parse_guide(v):
+    """'300k', '300000', '0.3m' -> tokens, or 0 when it is not a guide in GUIDE_MIN..GUIDE_MAX."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([km]?)\s*", (v or "").lower())
+    if not m:
+        return 0
+    n = int(float(m.group(1)) * {"": 1, "k": 1_000, "m": 1_000_000}[m.group(2)])
+    return n if GUIDE_MIN <= n <= GUIDE_MAX else 0
+
+
+def cmd_guide(rest):
+    """`guide` shows the guide here and where it comes from; `guide N` sets this project's own; `guide auto` drops it.
+    Writes only <project>/.claude/bigdad.json (the nearest one up from here, else ./.claude/bigdad.json)."""
+    import bd_common as BC
+    v = rest[0].strip().lower() if rest else ""
+    found = BC.project_file(os.getcwd())
+    target = found or os.path.join(os.getcwd(), BC.PROJECT_FILE)
+
+    def now():
+        g, src = BC.guard_at(), BC.guard_source()
+        where = f" ({found})" if src == "this project" and found else ""
+        return f"guide here: {g // 1000:,}k per call, from {src}{where}. A cost guide, not a limit."
+    if not v:
+        print(now())
+        return
+    if v != "auto" and not parse_guide(v):
+        print("usage: bigdad.py guide 300k   this project's per-call cost guide (10k to 1M tokens)")
+        print("       bigdad.py guide auto   back to your profile (or the default)")
+        print("       bigdad.py guide        show it")
+        print(now())
+        return
+    home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
+    if not found and (os.path.normcase(os.path.abspath(os.getcwd())) == home or
+                      os.path.normcase(os.path.dirname(os.path.abspath(target))) == os.path.normcase(os.path.abspath(BC.config_dir()))):
+        print("Big Dad guide: run this from the project folder (here it would land in your Claude folder); nothing written.")
+        return
+    d = BC.load_json(target) if os.path.isfile(target) else {}
+    if v == "auto":
+        if "guard_at" not in d:
+            print("Big Dad guide: this project sets none; nothing changed. " + now())
+            return
+        d.pop("guard_at")
+    else:
+        d["guard_at"] = parse_guide(v)
+    try:
+        if d:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            tmp = f"{target}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=1)
+            BC.replace_file(tmp, target)
+        else:
+            BC.remove_file(target)
+    except OSError as e:
+        print(f"Big Dad guide: could not write {target}: {e}; nothing changed.")
+        return
+    if v == "auto":
+        print(f"Big Dad guide: this project's own guide removed ({target}). " + now())
+        return
+    g = d["guard_at"]
+    print(f"Big Dad guide for this project: {g // 1000:,}k per call, a cost guide, not a limit (Big Dad notes a call past it; "
+          f"nothing is blocked). Saved in {target}; the hooks read it from the session's folder. Back: bigdad.py guide auto.")
+    if BC.guard_source() == "BIGDAD_GUARD_AT":
+        print(f"  BIGDAD_GUARD_AT is set, and it still wins: guide here is {BC.guard_at() // 1000:,}k until you unset it.")
+    w = count(BC.profile().get("window"))   # thirty-ninth review: through count() (int(Infinity) raised OverflowError)
+    if w and g >= w:
+        print(f"  Over your auto-compact window ({w // 1000:,}k, from setup): Claude Code compacts before a call gets this big,"
+              " so Big Dad's note would not come first.")
+
+
 def cmd_receipt(rest):
-    """The receipt for one chat: the newest chat by default, or a session id (or its start) or a log path."""
-    import glob
+    """The receipt for one chat: the newest chat by default, or a session id (or its start) or a log path.
+    The short receipt; --full prints the full one."""
     import bd_common as BC
     import bd_money as M
+    flag = False if "--no-color" in rest else True if "--color" in rest else None    # bd_money.want_color's rule
+    full = "--full" in rest
+    rest = [a for a in rest if a not in ("--color", "--no-color", "--full")]
     arg = rest[0] if rest else ""
     if arg and os.path.isfile(arg):
         path = arg
     else:
-        logs = sorted(glob.glob(os.path.join(BC.config_dir(), "projects", "*", "*.jsonl")), key=os.path.getmtime)
+        logs = sorted(glob.glob(os.path.join(glob.escape(BC.config_dir()), "projects", "*", "*.jsonl")), key=os.path.getmtime)
         hits = [p for p in logs if os.path.basename(p).startswith(arg)]
         if not hits:
             print("🥛 Big Dad: no chat log found" + (f" for {arg}" if arg else "") + ".")
             return
         path = hits[-1]
     sid = os.path.splitext(os.path.basename(path))[0]
-    print(M.receipt_text(path, sid, sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
+    print(M.receipt_text(path, sid, M.want_color(sys.stdout, flag), full=full))
 
 
 def main():
@@ -854,6 +1094,9 @@ def main():
     if cmd == "probe":
         cmd_probe(Claude(), rest)
         return
+    if cmd == "guide":
+        cmd_guide(rest)
+        return
     if cmd == "agent-stop":
         import bd_common as BC
         f = BC.stop_file()
@@ -869,7 +1112,7 @@ def main():
                   "       bigdad.py agent-stop 2     (on: cap at 2x the guide)\n"
                   "       bigdad.py agent-stop off")
             cap = BC.stop_cap()
-            print(f"now: {'on, ' + BC.stop_label(cap) if cap else 'off'}; guide {BC.guard_at() // 1000:,}k per call")
+            print(f"now: {'on, ' + BC.stop_label(cap) if cap else 'off'}; cost guide {BC.guard_at() // 1000:,}k per call ({BC.guard_source()}), not a limit")
             return
         os.makedirs(os.path.dirname(f), exist_ok=True)
         with BC.open_wait(f, "w", encoding="utf-8") as fh:
@@ -899,7 +1142,7 @@ def main():
         if x != 0 and x < 1:
             print("usage: bigdad.py pause 2     (end the turn once the main chat passes 2x the guide; interactive only)\n"
                   "       bigdad.py pause off")
-            print(f"now: {'at ' + format(BC.pause_at(), 'g') + 'x' if BC.pause_at() else 'off'}; guide {BC.guard_at() // 1000:,}k per call")
+            print(f"now: {'at ' + format(BC.pause_at(), 'g') + 'x' if BC.pause_at() else 'off'}; cost guide {BC.guard_at() // 1000:,}k per call ({BC.guard_source()}), not a limit")
             return
         os.makedirs(os.path.dirname(f), exist_ok=True)
         with BC.open_wait(f, "w", encoding="utf-8") as fh:
@@ -969,7 +1212,7 @@ def main():
         __import__("bd_baseline").cmd_baseline(rest)
         return
     if cmd == "setup":
-        __import__("bd_setup").cmd_setup(measure="--no-measure" not in rest)
+        __import__("bd_setup").cmd_setup(measure="--measure" in rest)    # only an explicit --measure runs hooks
         return
     if cmd == "refresh":
         __import__("bd_refresh").cmd_refresh(rest)
@@ -1009,7 +1252,7 @@ def main():
         sys.exit(f"unknown command: {cmd} (see the top of this file)")
     if not agents:
         print("No Claude Code session logs found. Use Claude Code for a session, then rerun.")
-        print(f"  looked in: {os.path.join(CLAUDE_DIR, 'projects')}")
+        print(f"  looked in: {shown_log(os.path.join(CLAUDE_DIR, 'projects'))}")   # thirty-sixth review: env path, safely
         return
     n = int(rest[0]) if rest and rest[0].isdigit() else None
     for a in agents:
@@ -1048,6 +1291,9 @@ def main():
 if __name__ == "__main__":
     if BC:
         BC.patient()                # a command waits out a file held open elsewhere longer than a hook does
+    # thirty-seventh review: the net at the door, both streams, kept to the end (error lines and tracebacks too)
+    sys.stdout = SafeOut(sys.stdout) if sys.stdout is not None else None
+    sys.stderr = SafeOut(sys.stderr) if sys.stderr is not None else None
     try:
         main()
     except BrokenPipeError:

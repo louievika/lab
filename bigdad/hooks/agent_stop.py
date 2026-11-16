@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bd_common as C
 
 ALLOW = {"Write", "Edit", "MultiEdit", "NotebookEdit", "SubagentHandback"}      # handoff + report back still work
-HANDOFF_PARTS = "goal, done so far, files touched + their state, the exact next step, open risks"
+HANDOFF_PARTS = C.HANDOFF + ", the exact next step"     # the same five as every handoff ask, + next step
 
 
 def stop_state(sid, agent):

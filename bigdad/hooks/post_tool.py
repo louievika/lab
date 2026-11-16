@@ -11,8 +11,15 @@ import bd_common as C
 
 
 def main():
-    event = C.read_event()
+    event = C.read_event(need_state=False)
     if event is None:
+        return
+    if C.state_problem():              # 3.0.0 review: refused state folder; every part stays idle except the pause the
+        try:                           # user set, which needs only the log and the settings (nothing is written)
+            import context_guard
+            C.emit(context_guard.refused_pause(event))
+        except Exception:
+            pass
         return
     if not C.dstr(event.get("agent_id")):          # heartbeat: the per-tool-call guard is running in this session
         try:

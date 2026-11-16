@@ -35,13 +35,19 @@ def bd_dir():
     return os.environ.get("BIGDAD_HOME") or os.path.join(config_dir(), "bigdad")
 
 
-def load(path):
+def load(path, damaged=None):
+    """The JSON object in path, else {}. damaged: what a file that is there but can't be read, can't be parsed or is
+    not an object gives instead (thirty-sixth review: hooks_note tells it from no file); {} when None."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+        if isinstance(d, dict):
+            return d
+    except (FileNotFoundError, NotADirectoryError):
         return {}
+    except (OSError, ValueError, RecursionError):
+        pass
+    return {} if damaged is None else damaged
 
 
 def enabled(cwd=""):
@@ -106,18 +112,33 @@ def bigdad_on(cwd=""):
     return any(k.partition("@")[0] == "bigdad" for k in enabled(cwd))
 
 
+def _usable_ts(v, now):
+    """A time read back from a file is usable only as a number, not a bool, with 0 < v <= now + SLACK (thirty-fourth
+    review: the sentinel imports nothing of Big Dad's, so the rule lives here; a far-future load ts passed the old
+    10**12 top and hid the "did not run" note for good). NaN and inf fail the comparison."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= now + SLACK
+
+
 def hooks_note(state, cwd=""):
     """Big Dad is enabled but its own SessionStart did not run in the last session the sentinel saw."""
     if not bigdad_on(cwd):
         return ""
+    now = time.time()
     prev = state.get("last_run")
-    if not isinstance(prev, (int, float)) or not prev:
-        return ""                      # first run: nothing to compare against yet
-    load_row = load(os.path.join(bd_dir(), "plugin-load.json"))
-    seen = load_row.get("ts") if isinstance(load_row.get("ts"), (int, float)) else 0
+    if not _usable_ts(prev, now):
+        return ""                      # first run (or a damaged last_run: NaN, inf, future): nothing to compare against
+    load_row = load(os.path.join(bd_dir(), "plugin-load.json"), damaged=False)
+    seen = load_row.get("ts") if isinstance(load_row, dict) else False
+    # thirty-fifth review: "never" only when no load time is on file (no file, no ts, null); one that is there but
+    # not usable (future, NaN, true, a string) still warns, and says its time can't be read. Thirty-sixth review: a
+    # file that is there but can't be read or parsed, or is not an object, is "time not readable" too, not "never"
+    when = "never" if seen is None else "time not readable"
+    if not _usable_ts(seen, now):      # thirty-first review: a NaN or negative ts raised at localtime
+        seen = 0
     if seen >= prev - SLACK:
         return ""
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(seen)) if seen else "never"
+    if seen:                           # thirty-sixth review: usable (0 < ts <= now + SLACK), localtime takes it
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(seen))
     return ("Big Dad is enabled but its hooks did not run in your last session (last loaded: "
             f"{when}). Run `claude plugin list`; if it says failed to load, re-add the marketplace or reinstall.")
 
@@ -135,7 +156,7 @@ def read_event():
     try:
         e = json.load(sys.stdin)
         return e if isinstance(e, dict) else {}
-    except (ValueError, OSError, UnicodeDecodeError):
+    except (ValueError, OSError, UnicodeDecodeError, RecursionError):
         return {}
 
 
@@ -173,7 +194,7 @@ def statusline():
         pass
     try:
         event = json.loads(raw.decode("utf-8", "replace") or "{}")
-    except ValueError:
+    except (ValueError, RecursionError):        # 3.0.0 eleventh review: too deeply nested is no event too
         event = {}
     cwd = event.get("cwd") if isinstance(event, dict) and isinstance(event.get("cwd"), str) else ""
     found = problems(cwd)

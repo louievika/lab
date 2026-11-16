@@ -136,7 +136,7 @@ def run_dirs(root, i, arm):
     home, work, state = (os.path.join(run_root, n) for n in ("home", "work", "state"))
     cfg = os.path.join(home, ".claude")
     for d in (cfg, work, state):
-        os.makedirs(d)
+        os.makedirs(d, mode=0o700)    # 3.0.0 review: a BIGDAD_STATE_DIR folder open to others is refused
     return run_root, cfg, home, work, state
 
 
@@ -163,13 +163,18 @@ def hook_text(output):
     s = output or ""
     try:
         o = json.loads(s)
-    except ValueError:
+    except (ValueError, RecursionError):
         return s
     if not isinstance(o, dict):
         return s
     h = o.get("hookSpecificOutput") if isinstance(o.get("hookSpecificOutput"), dict) else {}
     return " ".join(str(x) for x in (o.get("systemMessage"), h.get("additionalContext"), h.get("permissionDecisionReason"),
                                      o.get("reason")) if x)
+
+
+def _n(v):
+    """A count in a stream-json usage, int() as before; fortieth review: a bool is not a count (True read as 1)."""
+    return 0 if isinstance(v, bool) else int(v or 0)
 
 
 def parse_stream(text):
@@ -180,7 +185,7 @@ def parse_stream(text):
     for line in text.splitlines():
         try:
             d = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(d, dict):
             continue
@@ -190,16 +195,22 @@ def parse_stream(text):
             u = m.get("usage") if isinstance(m.get("usage"), dict) else {}
             mid = m.get("id")
             if u and mid not in seen:
-                seen.add(mid)
                 cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
-                cw = int(u.get("cache_creation_input_tokens") or 0)
-                w1h = min(cw, int(cc.get("ephemeral_1h_input_tokens") or 0))
-                r["calls"].append({"new": int(u.get("input_tokens") or 0), "w5": cw - w1h, "w1h": w1h,
-                                   "read": int(u.get("cache_read_input_tokens") or 0), "out": int(u.get("output_tokens") or 0)})
+                cw = _n(u.get("cache_creation_input_tokens"))
+                w1h = min(cw, _n(cc.get("ephemeral_1h_input_tokens")))
+                new, rd = _n(u.get("input_tokens")), _n(u.get("cache_read_input_tokens"))
+                if new + cw + rd > 0:       # fortieth review: above 0 (a negative sum was kept and marked its id)
+                    # thirty-ninth review: only a row with input counts is kept and marks its id (a block whose
+                    # counts read 0 no longer hides the good block of the same id)
+                    if mid is not None:     # fortieth review: an id-less call is never a duplicate (None was added)
+                        seen.add(mid)
+                    r["calls"].append({"new": new, "w5": cw - w1h, "w1h": w1h, "read": rd,
+                                       "out": _n(u.get("output_tokens"))})
                 r["model"] = r["model"] or str(m.get("model") or "")
             for c in m.get("content") or []:
                 if isinstance(c, dict) and c.get("type") == "tool_use" and not (c.get("id") and c.get("id") in seen):
-                    seen.add(c.get("id"))                    # the same call logged twice: count it once
+                    if c.get("id"):                          # the same call logged twice: count it once; fortieth
+                        seen.add(c.get("id"))                # review: an id-less one adds no None (it hid id-less calls)
                     inp = c.get("input") if isinstance(c.get("input"), dict) else {}
                     what = os.path.basename(str(inp.get("file_path") or "")) if c.get("name") == "Read" else ""
                     r["tools"].append(f"{c.get('name')}:{what}" if what else str(c.get("name")))
@@ -465,7 +476,7 @@ def _legs(i, arm, snap, budget, raw_dir, ctx, cfg, cwd, env, legs):
 def count_files(root):
     out = {}
     for group, pats in (("hooks", HOOK_FILES), ("scripts", SCRIPT_FILES)):
-        files = sorted(p for pat in pats for p in glob.glob(os.path.join(root, *pat.split("/"))))
+        files = sorted(p for pat in pats for p in glob.glob(os.path.join(glob.escape(root), *pat.split("/"))))
         lines = 0
         for p in files:
             with open(p, "rb") as f:
@@ -475,7 +486,7 @@ def count_files(root):
     try:
         with open(os.path.join(root, "hooks", "hooks.json"), encoding="utf-8", errors="replace") as f:
             hooks = json.load(f).get("hooks", {})
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         hooks = {}
     out["hook_events"] = sorted(hooks)
     out["hook_commands"] = sum(len(h.get("hooks", [])) for ev in hooks.values() for h in ev)
@@ -515,7 +526,7 @@ def measure_latency(root, reps=30):
         bd = os.path.join(cfg, "bigdad")
         state = os.path.join(tmp, "state")
         for d in (bd, state, os.path.join(cfg, "projects", "x")):
-            os.makedirs(d)
+            os.makedirs(d, mode=0o700)   # private, like the hooks need (3.0.0 review)
         with open(os.path.join(bd, "baseline.json"), "w", encoding="utf-8") as f:     # a shown, fresh baseline: no background build
             json.dump({"ts": "2026-01-01T00:00:00", "guide": GUARD_AT, "chats": 1, "logs": 1, "shown": True, "calls": 1,
                        "sent": 1, "resent_share": 0.5, "startup_median": 1, "peak": 1, "past_guide": 0, "above_guide": 0}, f)
@@ -598,10 +609,9 @@ def observational(transcript, reps=3):
 
 def realdir_snapshot():
     """Big Dad's own outputs in the real ~/.claude/bigdad (not live.json, not versus/): name -> (size, mtime)."""
-    import bd_common as C
     out = {}
     for pat in ("*.jsonl", "*.json", "*.html", "python-cmd"):
-        for p in glob.glob(os.path.join(C.bd_dir(), pat)):
+        for p in glob.glob(os.path.join(glob.escape(C.bd_dir()), pat)):
             if os.path.basename(p) == "live.json":
                 continue
             try:
@@ -627,7 +637,6 @@ def realdir_diff(before, after):
 def new_agent_rows(before):
     """agent_type of each agents.jsonl row added during the test. A real type means another live session started or
     stopped a real agent meanwhile; '?' means a stop with no agent (the old phantom-row bug)."""
-    import bd_common as C
     skip = (before.get("agents.jsonl") or (0, 0, 0))[2]
     rows = []
     try:
@@ -635,9 +644,11 @@ def new_agent_rows(before):
             for i, line in enumerate(f):
                 if i >= skip:
                     try:
-                        rows.append(str(json.loads(line).get("agent_type") or "?"))
-                    except ValueError:
-                        rows.append("?")
+                        d = json.loads(line)
+                    except (ValueError, RecursionError):
+                        d = None
+                    # twenty-ninth review: JSON that is not an object reads as an unparseable line does ("?")
+                    rows.append((C.dstr(d.get("agent_type")) or "?") if isinstance(d, dict) else "?")   # thirtieth review: only a str is a type
     except OSError:
         pass
     return rows
@@ -659,7 +670,7 @@ def versus_root(flag=""):
 def real_sessions(sids):
     """Versus sessions found in the real config dir's projects (must be 0: every run has its own config dir)."""
     dirs = {os.path.join(I.real_home(), ".claude")} | ({os.environ["CLAUDE_CONFIG_DIR"]} if os.environ.get("CLAUDE_CONFIG_DIR") else set())
-    return sum(len(glob.glob(os.path.join(d, "projects", "*", f"{sid}.jsonl"))) for d in dirs for sid in sids if sid)
+    return sum(len(glob.glob(os.path.join(glob.escape(d), "projects", "*", glob.escape(f"{sid}.jsonl")))) for d in dirs for sid in sids if sid)
 
 
 def cmd_run(args):
@@ -704,9 +715,12 @@ def cmd_run(args):
             I.make_private(root, folder=True)
         except (OSError, RuntimeError, subprocess.SubprocessError) as e:
             print(f"versus run: warning, the run folder could not be made private: {e}", flush=True)
-    stale = I.sweep_logins(root)             # a run killed hard last time left its login copy: gone before anything
+    others = []
+    stale = I.sweep_logins(root, others)     # a run killed hard last time left its login copy: gone before anything
     if stale:
         print(f"versus run: deleted {len(stale)} login copies an earlier killed run left under {root}", flush=True)
+    if I.others_line(others, root):
+        print("versus run: " + I.others_line(others, root), flush=True)
     work = tempfile.mkdtemp(prefix="versus-", dir=root)
     say = lambda s: print(s, flush=True)
     say(f"🥛 Big Dad versus stock Claude Code: {runs} runs per arm, cap {big(cap)} tokens, root {root}, out {out}")
@@ -1195,7 +1209,7 @@ def cmd_receipt(args):
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             d = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         sys.exit(f"versus receipt: cannot read {path}: {e}")
     md, text = build_receipt(d)
     with open(os.path.join(out, "VERSUS-RECEIPT.md"), "w", encoding="utf-8") as f:

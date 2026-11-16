@@ -3,7 +3,7 @@
 One at a time (bd_dir()/baseline.building, taken with O_EXCL; a lock older than 10 minutes is a crashed run).
   profile   rebuilt only when the setup fingerprint moved (Claude Code version, skills, plugins, MCP servers,
             hooks, window settings), when it is missing, or 7+ days old. Built without running any hook (the
-            launch cost is measured by the next report that needs it).
+            launch cost comes from Claude Code's logs; only `setup --measure`, typed by the user, runs hooks).
   baseline  updated from the per-log cache: only new or changed logs are read, rewritten only when a number
             moved. The full build (every log read again) stays the fallback when missing or 7+ days old.
   learning  ended once the baseline covers enough calls and a profile exists (bd_learn.end_if_ready).
@@ -58,7 +58,7 @@ def profile_why(cwd):
         return "no setup fingerprint yet"
     try:
         age = (time.time() - time.mktime(time.strptime(str(p.get("at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))) / 86400
-    except (ValueError, TypeError, OverflowError):
+    except (ValueError, TypeError, OverflowError, OSError):   # fortieth review: OSError too, as bd_setup.stale
         return "profile has no date"
     if age > S.STALE_DAYS:
         return f"profile is {age:.0f} days old"

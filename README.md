@@ -6,15 +6,22 @@
 
 <p align="center">
   The token watchdog for Claude Code<br>
-  Plugin version 2.0.8 · MIT · Windows, macOS, Linux
+  Plugin version 3.0.0 · MIT · Windows, macOS, Linux
 </p>
 
 ## Watch the ad
 
-https://github.com/user-attachments/assets/1021fd70-1975-4621-9497-18a5dfa49e3c
+<!-- VIDEO: upload assets/bigdad-ad-github-720p.mp4 to GitHub and paste its user-attachments URL on the next line -->
+
+
+<!-- POSTER START: stand-in until the video URL is in. assets/poster.jpg is the ad's thumbnail; the poster opens assets/bigdad-ad-github-720p.mp4. Delete from here to POSTER END once the URL line above is filled in. -->
+<p align="center">
+  <a href="assets/bigdad-ad-github-720p.mp4"><img src="assets/poster.jpg" width="100%" alt="Watch the ad. Every call re-sends everything."></a>
+</p>
+<!-- POSTER END -->
 
 <p align="center">
-  <img src="assets/preview-loop.webp" width="80%" alt="Silent loop from the ad. Same file read 3 times: on Haiku $0.0095 without Big Dad, $0.0048 with, -49.4%. On Sonnet $0.1745 to $0.0819, -53.1%.">
+  <img src="assets/preview-loop.webp" width="80%" alt="Silent loop from the ad. Same file read 3 times: on Haiku $0.0095 without Big Dad, $0.0048 with, -49.4%. On Sonnet $0.1745 to $0.0819, -53.1%. Measured on v2.0.7, 12 Nov 2026.">
 </p>
 
 ## What it is
@@ -53,7 +60,29 @@ Needs Python 3 (3.9 or newer). Update: `claude plugin update bigdad@lab`. Remove
 
 Type `receipt` in any chat for that chat's receipt, read from its own log. It costs 0 tokens: the prompt never reaches the model.
 
+## New in 3.0.0
+
+- **Short receipt.** `receipt` now prints 44 columns and at most 18 lines, in plain red, yellow and green. `receipt full` prints every line.
+- **Compact and guide.** `health` and `setup` say when auto-compact is off and where. `guide` sets a cost guide for one project. Compacting is Claude Code's own feature; Big Dad only hands it instructions.
+- **Helper agents.** The guards now work inside helper agents. A helper past its guide is asked to hand off at a natural break, or told to stop if you turn the hard stop on. If a helper ends on a usage limit or a lost login, the main chat is told once.
+- **Fits your setup.** Reports and setup never run your hooks. Company-managed settings are respected and never get a proposed cut. JSON output is never cut.
+- **Security and correctness.** The fixes from an outside review of 2.0.9: safer checks on Big Dad's state folder, Windows permission fixes, and atomic saves.
+
+3.0.0 has not been benched for cost yet. The results below were measured on the versions named.
+
 ## Measured results
+
+Opus, 2.0.9, one helper agent and one file read three times, with and without Big Dad. Same prompts, same model.
+
+| Case | Tokens, without to with | Dollars, without to with |
+|---|---|---|
+| Same file read 3 times | 160.1k to 92.4k (-42.3%) | $0.3498 to $0.1627 (-53.5%) |
+| Helper agent | 122.7k to 93.2k (-24.1%) | $0.1778 to $0.1666 (-6.3%) |
+| Whole 7-case suite | 815.4k to 739.9k (-9.3%) | $1.4914 to $1.2503 (-16.2%) |
+
+Opus, 3 runs a side (42 runs), median, Windows, Claude Code 2.1.325, Big Dad 2.0.9. Dollars are Claude Code's own cost figure, not a bill. Not all cases went our way: in the same suite a light chat cost 50.0% more tokens (+7.2% dollars), a compacted chat cost 1.4% more dollars, and reads that must not be blocked cost 1.1% more.
+
+Haiku and Sonnet, 2.0.7:
 
 <p align="center">
   <img src="assets/03-haiku-49-4.jpg" width="80%" alt="Same file read 3 times on Haiku: $0.0095 without Big Dad, $0.0048 with, -49.4%. 10 runs a side, median cost per run, 12 Nov 2026, measured on v2.0.7.">
@@ -68,23 +97,32 @@ Type `receipt` in any chat for that chat's receipt, read from its own log. It co
 Dollars per run, median, by Claude Code's own cost figure (not a bill). Measured on v2.0.7 on 12 Nov 2026. The first two rows come from a 7-case bench of 182 headless runs (Haiku 70 + 70, Sonnet 21 + 21), a fresh profile for every run. The four-task set was a separate run on the same day; its two run ranges do not touch.
 
 <p align="center">
-  <img src="assets/04-four-tasks-17-5.jpg" width="80%" alt="Four-task set on Haiku: $0.0194 with nothing installed, $0.0160 with Big Dad, -17.5%. 5 runs a side, each dot one run, run ranges do not touch.">
+  <img src="assets/04-four-tasks-17-5.jpg" width="80%" alt="Four-task set on Haiku: $0.0194 with nothing installed, $0.0160 with Big Dad, -17.5%. 5 runs a side, each dot one run, run ranges do not touch. 12 Nov 2026, measured on v2.0.7.">
 </p>
 
 Everyday use, 6-10 Nov 2026 (90 chats, Big Dad's own count, versions 1.0 to 2.0.3): Big Dad cost 84k tokens and saved 577k.
+
+Slim compacts in live use, 8 to 10 Nov 2026: 12 compacts, tokens per call summed 2.17M to 0.75M (-65%), about 118k smaller per later call. Big Dad's own count, the receipt covers versions 1.0 to 2.0.3; not multiplied by later calls and not in the totals.
 
 <p align="center">
   <img src="assets/05-receipt.jpg" width="80%" alt="Big Dad receipt. Everyday use 6-10 Nov 2026: Big Dad cost 84k tokens, saved 577k tokens. Light tasks: no measurable change, measured on v2.0.7.">
 </p>
 
+End-to-end loop, 12 Nov 2026: Big Dad 2.0.6 against 2.0.7, installed as a real plugin in headless Claude Code, 26 live runs (Haiku 12, Sonnet 14). Every scenario passed on both sides except one, partial on both: the report rule "one line per finding". One run per scenario per side. Limits: profiles were not isolated from the account's synced plugins; Windows only, Linux and macOS not run.
+
+Early head-to-head runs, 8 Nov 2026 (Big Dad development builds from 8 Nov 2026, before 1.5.0, Haiku, 3 runs a side, median input per run): v1 360k to 352k (-2%), 3 of 3 correct without and 0 of 3 with (a Big Dad bug, fixed in 1.5.0); v2 411k to 320k (-22%), 2 of 3 and 2 of 3; v3 462k to 320k (-31%), 1 of 3 and 3 of 3; long run 961k to 472k (-51%), 0 of 3 and 3 of 3. Cost per run (Claude Code's own cost figure, not a bill): v1 $0.0336 to $0.0181, v2 $0.0470 to $0.0181, v3 $0.0475 to $0.0181. Old versions, 3 runs a side, the guide set to 20k so the notes fire, one PC.
+
 ### What it does not do
 
-- **Light tasks:** no measurable change. In the light-chat case Big Dad stayed silent.
+- **Light tasks:** the median showed no change (tokens Haiku +0.2%, Sonnet -0.1%), but the mean was higher with Big Dad (tokens +5.3% Haiku, +16.1% Sonnet; dollars +1.5% and +5.9%). The run ranges overlap, so this may be noise. Big Dad stayed silent in this case. 2.0.7, 12 Nov 2026; 10 runs a side on Haiku, 3 on Sonnet.
 - **Helper agents:** the helper-agent case cost about 7% more dollars with Big Dad (Haiku +7.0%, Sonnet +7.2%, median; the run ranges overlap).
 - **Whole suite on Haiku:** all 7 cases added up came out -9.0% in dollars, but the run ranges overlap, so the difference is inside the noise.
 - **Noisy output:** that case came out even; the output shrink did not fire in that test.
-- No saving is claimed for helper agents or compacts.
-- Limits of the bench: scripted cases, not real work; one Windows PC; Haiku and Sonnet only, no Opus.
+- **Output on the re-read case:** in the 4-task set (Haiku, 5 runs a side, 2.0.7, 12 Nov 2026) that case produced 767 output tokens with Big Dad against 318 with nothing installed (+141.2%, run ranges apart). Dollars on the same case fell from $0.0091 to $0.0067 (-26.9%).
+- **Big Dad's own cost, 6-10 Nov 2026:** counting the chats that built and tested Big Dad, it cost 1,562,688 tokens and saved 1,184,194: net -378,494 tokens. Building and testing alone: net -871,400. Everyday use alone: cost 84,144, saved 577,050. Big Dad's own count, versions 1.0 to 2.0.3.
+- No saving is claimed for helper agents. Compacts: see the live-use count above; in the 7-case bench the compact case showed no measurable change (the run ranges overlap).
+- **A fresh install** spends its first sessions learning and used 37% more tokens in one test.
+- Limits of the benches: scripted cases, not real work; one Windows PC; the 2.0.7 bench is Haiku and Sonnet only, the 2.0.9 bench Opus only, with one helper agent, not a fleet. 3.0.0 has no cost bench and no real-world run on a second machine yet.
 
 ## Check the numbers yourself
 
@@ -98,9 +136,13 @@ Everyday use, 6-10 Nov 2026 (90 chats, Big Dad's own count, versions 1.0 to 2.0.
 
   (from a clone of this repo; it spends a little of your own usage).
 
+<!-- GATES-3.0.0 -->
+Unit tests: 1,617 pass, 0 failures (43 skipped on Windows, 17 on Linux). Break test: 1,251 runs, 0 failures. Fuzz test: 5,296 runs, 0 failures. 3.0.0, 15 Nov 2026, in a Linux sandbox and natively on Windows 11 (one PC). Not run on macOS.
+<!-- /GATES-3.0.0 -->
+
 ## Version and licence
 
-Big Dad 2.0.8 · MIT · by LouieVika
+Big Dad 3.0.0 · MIT · by LouieVika
 
 <p align="center">
   <img src="assets/06-end-card.jpg" width="80%" alt="End card: Big Dad's home. Big Dad for Claude Code. github.com/louievika/lab">

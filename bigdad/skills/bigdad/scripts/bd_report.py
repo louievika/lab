@@ -6,7 +6,7 @@ names on the page; counts, sizes and short labels only. Prints the page's path.
 
   python bigdad.py report [HOURS] [--out FILE]
 """
-import html, io, json, os, re, time
+import html, io, os, re, time
 from collections import defaultdict
 from contextlib import redirect_stdout
 import bd_health as H
@@ -18,14 +18,17 @@ PALETTE = ["#4F6BED", "#E08A2E", "#2BA37A", "#C8477D", "#7A5AC8", "#8A8F98"]
 
 
 def esc(s):
-    return html.escape(str(s))
+    """s as HTML text or a quoted attribute value: & < > " ' escaped (html.escape, quote=True). Thirty-eighth review:
+    scrubbed first, so a home path holding & or ' is still found and scrub's <id> / <email> marks show as text (the
+    page-wide scrub ran on escaped text, so it missed such a path and wrote its marks as raw tags)."""
+    return html.escape(scrub(str(s)), quote=True)
 
 
 def calls_over_time(proj, since):
     """(ts, input tokens, model family, mode) per distinct API call in logs touched since `since`."""
     pts = []
     import glob
-    for p in glob.glob(os.path.join(proj, "**", "*.jsonl"), recursive=True):
+    for p in glob.glob(os.path.join(glob.escape(proj), "**", "*.jsonl"), recursive=True):
         try:
             if os.path.getmtime(p) < since:
                 continue
@@ -41,21 +44,21 @@ def calls_over_time(proj, since):
                     entry = m.group(1) if m else None
                 if '"usage"' not in line:
                     continue
-                try:
-                    r = json.loads(line)
-                except ValueError:
+                try:                                  # twentieth review: bd_models' row rules, as scan reads them
+                    got = M._usage_row(line, 0, seen)  # since 0: every call's id is seen, whatever its time
+                except M.ODD_ROW:                     # a row that cannot be read: skipped whole
                     continue
-                if not isinstance(r, dict) or r.get("type") != "assistant":
+                if got is None:
                     continue
-                msg = r.get("message") or {}
-                u, mid = msg.get("usage") or {}, msg.get("id")
-                if not u or mid in seen:
+                mid, t, fam, n, _ = got
+                # thirty-ninth review: only a row with counts marks its id (a damaged first block no longer hides
+                # the good block of the same id)
+                if not n > 0:                         # fortieth review: above 0 (a negative or NaN sum was kept)
                     continue
-                seen.add(mid)
-                t = M.ts(r.get("timestamp") or "")
-                n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-                if t >= since and n:
-                    rows.append((t, n, M.short_model(msg.get("model"))))
+                if mid is not None:                   # twenty-first review: an id-less row never hides a later one
+                    seen.add(mid)
+                if t >= since:
+                    rows.append((t, n, fam))
         mode = M.mode_of(p, entry, meta)
         pts += [(t, n, fam, mode) for t, n, fam in rows]
     pts.sort()
@@ -87,10 +90,12 @@ def svg_scatter(pts, w=880, h=260):
         x = L + (w - L - R) * (t - t0) / (t1 - t0)
         y = T + (h - T - B) * (1 - n / ymax)
         shape = "circle" if mode in ("interactive", "headless") else "rect"
+        # thirty-eighth review: the family (a log's model) and the mode (an agent type from a .meta.json) through esc
+        tip = f"<title>{esc(mode)}, {esc(f)}: {n:,} tokens</title>"
         if shape == "circle":
-            out.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='2.6' fill='{color[f]}' opacity='.75'><title>{mode}, {f}: {n:,} tokens</title></circle>")
+            out.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='2.6' fill='{color[f]}' opacity='.75'>{tip}</circle>")
         else:
-            out.append(f"<rect x='{x - 2.4:.1f}' y='{y - 2.4:.1f}' width='4.8' height='4.8' fill='{color[f]}' opacity='.75'><title>{mode}, {f}: {n:,} tokens</title></rect>")
+            out.append(f"<rect x='{x - 2.4:.1f}' y='{y - 2.4:.1f}' width='4.8' height='4.8' fill='{color[f]}' opacity='.75'>{tip}</rect>")
     out.append("</svg>")
     legend = " ".join(f"<span class='key'><i style='background:{color[f]}'></i>{esc(f)}</span>" for f in fams)
     legend += " <span class='key'><i class='dot'></i>interactive / headless</span> <span class='key'><i class='sq'></i>agents, forks, workflows</span>"
@@ -175,17 +180,13 @@ def scrub(s):
 
 def agent_rows(hours):
     import bd_agents as A
-    buf = io.StringIO()
+    buf, got = io.StringIO(), []
     try:
         with redirect_stdout(buf):
-            A.cmd_agents(hours)
+            A.cmd_agents(hours, table=got)       # twenty-ninth review: its rows as data, not its text split on spaces
     except Exception:
         return []
-    rows = []
-    for l in buf.getvalue().splitlines():
-        parts = l.split()
-        if parts and parts[0] in ("running", "done") and len(parts) >= 6:
-            rows.append([parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], " ".join(parts[6:])])
+    rows = [[r["state"], r["type"], r["model"], r["calls"], r["last"], r["total"], ", ".join(r["flags"])] for r in got]
     flags = [scrub(l.strip()) for l in buf.getvalue().splitlines() if l.strip().startswith(("flag:", "ok:"))]
     return rows, flags
 
@@ -233,7 +234,17 @@ def cmd_report(args):
     # agents
     ar = agent_rows(hours)
     arows, aflags = (ar if ar else ([], []))
-    surfaces = ", ".join(f"{k} ×{v}" for k, v in (prof.get("surfaces") or {}).items()) or "not profiled yet"
+    # thirty-ninth review: each profile field read through bd_common's readers (a hand-edited field of the wrong type
+    # ended report with a traceback): a bad count reads as 0 (the guide as unset: its default), a bad text as '?', a
+    # bad table as empty
+    BC = S._bc()
+    window = BC.sane(prof.get("window"), 0, whole=True)
+    guard = prof.get("guard_at") if BC.guide_ok(prof.get("guard_at")) else 130000
+    surf = prof.get("surfaces") if isinstance(prof.get("surfaces"), dict) else {}
+    hp = prof.get("hooks_per_tool_call") if isinstance(prof.get("hooks_per_tool_call"), dict) else {}
+    plugins = prof.get("plugins") if isinstance(prof.get("plugins"), (dict, list)) else ()
+    at = BC.dstr(prof.get("at")) or "?"
+    surfaces = ", ".join(f"{k} ×{v}" for k, v in surf.items()) or "not profiled yet"
     hl = health_lines(cwd)
     def cls(l):
         return "sec" if l.startswith("[sec]") else "fix" if l.startswith("[fix]") else "ok"
@@ -241,7 +252,7 @@ def cmd_report(args):
 <title>Big Dad report</title><style>{CSS}</style></head><body><main>
 <h1>Big Dad report</h1>
 <p class='sub'>{esc(time.strftime('%Y-%m-%d %H:%M %Z'))} · last {hours:g} h · surfaces seen (7 days): {esc(surfaces)} · all numbers from Claude Code's own logs (verified: API usage) unless marked ≈</p>
-<h2>Tokens per call over time</h2><div class='card'>{svg_scatter(pts)}<p class='muted'>Every call re-sends the whole context. A staircase means the session kept growing; a drop is a /compact or a fresh session. Guard at {prof.get('guard_at', 130000) // 1000}k.</p></div>
+<h2>Tokens per call over time</h2><div class='card'>{svg_scatter(pts)}<p class='muted'>Every call re-sends the whole context. A staircase means the session kept growing; a drop is a /compact or a fresh session. Guard at {guard // 1000}k.</p></div>
 <h2>Startup load by source</h2><div class='card'>{parts_html}</div>
 <h2>Models × modes</h2><div class='card'>{table(["model", "mode", "calls", "input tokens", "output", "input/call", "share"],
     [[m, mode, f"{c:,}", M.big(i), M.k(o), M.k(i // max(c, 1)), f"{i / total_in:.0%}" if total_in else "-"]
@@ -252,13 +263,13 @@ def cmd_report(args):
 <h2>Health flags</h2><div class='card'><ul class='flags'>{"".join(f"<li class='{cls(l)}'>{esc(l)}</li>" for l in hl) or "<li class='muted'>health check produced no lines</li>"}</ul>
 <p class='muted'>Proposals only. Nothing is changed without a yes.</p></div>
 <h2>Profile (Big Dad's own knobs)</h2><div class='card kv'>
-<div><b>real window</b>{prof.get('window', 0) // 1000:,}k ({esc(prof.get('window_source', '?'))})</div>
-<div><b>guard per call</b>{prof.get('guard_at', 130000) // 1000:,}k ({esc(prof.get('guard_source', 'default'))})</div>
+<div><b>real window</b>{window // 1000:,}k ({esc(prof.get('window_source', '?'))})</div>
+<div><b>guard per call</b>{guard // 1000:,}k ({esc(prof.get('guard_source', 'default'))})</div>
 <div><b>big model</b>{esc(prof.get('big_model', '?'))} · max {esc(prof.get('max_big_agents', 1))} at a time</div>
 <div><b>Claude Code</b>{esc(prof.get('claude') or '?')} · {esc(prof.get('os', '?'))}</div>
-<div><b>setup</b>{esc(prof.get('skills', '?'))} skill folders · {len(prof.get('plugins') or {})} plugins · {esc(prof.get('mcp', '?'))} MCP servers</div>
-<div><b>hooks per tool call</b>{esc((prof.get('hooks_per_tool_call') or {}).get('count', '?'))} commands · ≈{esc((prof.get('hooks_per_tool_call') or {}).get('ms', '?'))} ms</div>
-<div><b>profiled</b>{esc((prof.get('at') or '?')[:16].replace('T', ' '))} {esc(prof.get('tz', ''))}</div>
+<div><b>setup</b>{esc(prof.get('skills', '?'))} skill folders · {len(plugins)} plugins · {esc(prof.get('mcp', '?'))} MCP servers</div>
+<div><b>hooks per tool call</b>{esc(hp.get('count', '?'))} commands · {esc(S.launch_cost_text(hp).replace('`', ''))}</div>
+<div><b>profiled</b>{esc(at[:16].replace('T', ' '))} {esc(prof.get('tz', ''))}</div>
 </div>
 <p class='muted' style='margin-top:30px'>Big Dad brings home the milk. Observe → note → propose → act only with a yes → prove → measure. No paths, ids or names on this page.</p>
 </main></body></html>"""

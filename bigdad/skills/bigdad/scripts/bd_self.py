@@ -32,6 +32,35 @@ SWITCH = {
 }
 
 
+# thirty-eighth review: a log field of the wrong type reads as missing (a str, a dict, a list, else empty / None) and
+# the row still counts where it can; bd_self loads without bd_common, so these are its own small readers
+def _s(v):
+    return v if isinstance(v, str) else ""
+
+
+def _d(v):
+    return v if isinstance(v, dict) else {}
+
+
+def _l(v):
+    return v if isinstance(v, list) else []
+
+
+def _id(v):
+    return v if isinstance(v, str) and v else None
+
+
+def _sent(u):
+    """A usage's input counts summed, each an int (not bool) up to 10**12, else read as 0 (thirty-ninth review).
+    Fortieth review: a negative count (input or output) makes it no call (0), the receipt's Tally.add rule; a
+    negative was read as 0 and the row still counted."""
+    u = _d(u)
+    raw = [u.get(k) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")]
+    if any(isinstance(v, (int, float)) and not isinstance(v, bool) and v < 0 for v in raw):
+        return 0
+    return sum(v for v in raw[:3] if type(v) is int and 0 <= v <= 10 ** 12)
+
+
 def tok(s):
     return len(s) // 4 if s else 0
 
@@ -40,7 +69,7 @@ def text_of(c):
     if isinstance(c, str):
         return c
     if isinstance(c, list):
-        return "".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+        return "".join(_s(x.get("text")) for x in c if isinstance(x, dict) and x.get("type") == "text")
     return ""
 
 
@@ -66,7 +95,7 @@ def part_of(event, text):
 
 def listing_line(content):
     """Big Dad's own line in a skill_listing attachment, or None."""
-    for line in str(content or "").splitlines():
+    for line in _s(content).splitlines():
         if re.match(r"\s*-\s*(bigdad:)?bigdad:", line):
             return line
     return None
@@ -84,11 +113,11 @@ def scan(path, since=""):
         for ln in fh:
             try:
                 e = json.loads(ln)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if not isinstance(e, dict):
                 continue
-            if since and str(e.get("timestamp") or "") < since:   # before this version: not its cost
+            if since and _s(e.get("timestamp")) < since:   # before this version: not its cost
                 continue
             cwd = e.get("cwd")
             if isinstance(cwd, str) and cwd not in cwds:
@@ -102,22 +131,28 @@ def scan(path, since=""):
                 continue
             m = e.get("message") if isinstance(e.get("message"), dict) else {}
             if t == "assistant":
-                mid = m.get("id")
-                if mid and mid not in seen_msg and m.get("usage"):
+                mid = _id(m.get("id"))
+                # thirty-ninth review: a call counts (and marks its id) only when its input counts are above 0, the
+                # rule of walk, modes and the receipt; a damaged first block no longer stands for the call
+                if mid and mid not in seen_msg and _sent(m.get("usage")):
                     seen_msg.add(mid)
                     ev.append(("call",))
-                for b in m.get("content") or []:
+                for b in _l(m.get("content")):
                     if isinstance(b, dict) and b.get("type") == "tool_use" and DEV.search(json.dumps(b.get("input"))):
                         ev.append(("touch",))
                     if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read":
-                        fp = str((b.get("input") or {}).get("file_path") or "")
-                        if b.get("id") not in reads:
-                            reads[b.get("id")] = fp
+                        fp = _s(_d(b.get("input")).get("file_path"))
+                        rid = _id(b.get("id"))
+                        # thirty-ninth review: an id-less Read is still a read event, but is never stored under
+                        # None (every id-less Read shared that one key: later ones were dropped)
+                        if rid is None or rid not in reads:
+                            if rid is not None:
+                                reads[rid] = fp
                             ev.append(("read", fp))
                 continue
             if t == "attachment":
                 a = e.get("attachment") if isinstance(e.get("attachment"), dict) else {}
-                at = str(a.get("type") or "")
+                at = _s(a.get("type"))
                 if at == "skill_listing":
                     line = listing_line(a.get("content"))
                     if line:
@@ -127,7 +162,7 @@ def scan(path, since=""):
                     c = c if isinstance(c, str) else " ".join(map(str, c)) if isinstance(c, list) else \
                         json.dumps(c, ensure_ascii=False) if c else ""
                     if c and BD.search(c):
-                        ev.append(("inject", part_of(str(a.get("hookEvent") or ""), c), tok(c)))
+                        ev.append(("inject", part_of(_s(a.get("hookEvent")), c), tok(c)))
                 continue
             if t != "user":
                 continue
@@ -138,18 +173,19 @@ def scan(path, since=""):
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text":
-                    s = b.get("text") or ""
+                    s = _s(b.get("text"))
                     if "Base directory for this skill" in s[:400] and "bigdad" in s[:400].lower():
                         ev.append(("inject", "skill page (/bigdad)", tok(s)))
                     continue
                 if b.get("type") != "tool_result":
                     continue
-                tid = b.get("tool_use_id")
+                tid = _id(b.get("tool_use_id"))
                 if tid and tid in seen_res:
                     continue
-                seen_res.add(tid)
+                if tid:
+                    seen_res.add(tid)
                 c = text_of(b.get("content"))
-                fp = reads.get(tid)
+                fp = reads.get(tid) if tid else None   # thirty-ninth review: an id-less result matches no Read
                 if b.get("is_error") and "Big Dad" in c[:120] and not c.startswith("Exit code"):   # Big Dad's own deny,
                     # not a failed command whose output happens to mention Big Dad
                     if OUTLINE in c:
@@ -213,7 +249,7 @@ def tally(ev, cost, saved, fired):
 
 def logs(root, days):
     cut = time.time() - days * 86400
-    for f in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+    for f in glob.glob(os.path.join(glob.escape(root), "**", "*.jsonl"), recursive=True):
         try:
             if os.path.getmtime(f) >= cut:
                 yield f
@@ -226,7 +262,7 @@ def installed(claude_dir):
     try:
         with open(os.path.join(claude_dir, "plugins", "installed_plugins.json"), encoding="utf-8") as fh:
             d = json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return "", ""
     rows = (d.get("plugins") if isinstance(d, dict) else None) or {}
     for k, v in rows.items() if isinstance(rows, dict) else ():

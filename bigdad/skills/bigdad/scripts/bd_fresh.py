@@ -28,7 +28,7 @@ def claude_version():
     try:
         out = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=20, shell=os.name == "nt",
                              stdin=subprocess.DEVNULL, creationflags=0x08000000 if os.name == "nt" else 0).stdout
-        m = re.search(r"\d+\.\d+\.\d+", out or "")
+        m = re.search(VERSION, out or "")          # a pre-release tag is kept: 2.1.0-beta.1 is before 2.1.0
         return m.group(0) if m else (out or "").strip()[:20]
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -41,7 +41,7 @@ def npm_latest():
     try:
         out = subprocess.run(["npm", "view", "@anthropic-ai/claude-code", "version"], capture_output=True, text=True,
                              timeout=20, shell=os.name == "nt").stdout
-        m = re.search(r"\d+\.\d+\.\d+", out or "")
+        m = re.search(VERSION, out or "")
         return m.group(0) if m else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -53,7 +53,7 @@ def snapshot(cwd):
     enabled = H.enabled_plugins(cwd)
     skills = sorted(H.skill_dirs(plugins, enabled))
     mcp = sorted(H.mcp_servers(cwd))
-    for p in sorted(glob.glob(os.path.join(H.CLAUDE_DIR, "projects", "*", "*.jsonl")), key=os.path.getmtime, reverse=True)[:5]:
+    for p in sorted(glob.glob(os.path.join(glob.escape(H.CLAUDE_DIR), "projects", "*", "*.jsonl")), key=os.path.getmtime, reverse=True)[:5]:
         try:
             with open(p, encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -95,6 +95,22 @@ def diff(old, new):
 
 def vtuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3]) or (0,)
+
+
+VERSION = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?"     # 2.1.0, 2.1.0-beta.1
+
+
+def vkey(v):
+    """A version's sort key, or None when it is not a version (a branch install's commit id, 'unknown', '?'): then
+    nothing is compared. 3.0 = 3.0.0; a pre-release sorts before its release (3.0.0-rc.1 < 3.0.0); 2.0.10 > 2.0.9."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+){1,3})(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?(?:\+[0-9A-Za-z.-]+)?", str(v or "").strip())
+    if not m:
+        return None
+    nums = [int(x) for x in m.group(1).split(".")]
+    nums += [0] * (4 - len(nums))
+    pre = m.group(2)
+    return tuple(nums) + ((1,) if not pre else
+                          (0,) + tuple((0, int(x), "") if x.isdigit() else (1, 0, x) for x in pre.split(".")))
 
 
 def fetch(url, timeout=15):
@@ -170,7 +186,7 @@ def release_notes(known):
 def last_check_age(inv):
     try:
         return (time.time() - time.mktime(time.strptime((inv.get("checked_at") or inv.get("at") or "")[:19], "%Y-%m-%dT%H:%M:%S"))) / 86400
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):   # fortieth review: a year mktime can't take (9999, 0001)
         return None
 
 
@@ -190,13 +206,20 @@ def own_market_line(plugins):
         if not mv:
             return f"  Big Dad: installed {ver}; marketplace copy has no version to compare. Not checked online."
         when = str(m.get("lastUpdated") or "?")[:16].replace("T", " ")
-        state = (f"{mv} is ready: update it from `/plugin`" if vtuple(mv) > vtuple(ver) else
-                 f"newest this PC knows; `/plugin marketplace update {mk}` fetches newer")
+        iv, mkv = vkey(ver), vkey(mv)
+        if iv is None or mkv is None:      # a branch install (commit id), 'unknown': no version to put side by side
+            state = f"not compared: {ver if iv is None else mv} is not a version number (a branch or local copy?)"
+        else:
+            state = (f"{mv} is ready: update it from `/plugin`" if mkv > iv else
+                     f"newest this PC knows; `/plugin marketplace update {mk}` fetches newer")
         return f"  Big Dad: installed {ver}, marketplace copy {mv} (fetched {when} UTC): {state}. Not checked online."
     return ""
 
 
 def cmd_fresh(cwd=None):
+    # fetched, command and state-file text printed through bd_common.shown (thirty-sixth review); thirty-seventh
+    # review: bound once here, not looked up again for every printed line
+    printable = H.common().shown
     cwd = cwd or os.getcwd()
     new = snapshot(cwd)
     old = H.load_json(INV)
@@ -206,36 +229,41 @@ def cmd_fresh(cwd=None):
     print(f"  last check: {'none' if age is None else f'{age:.1f} days ago'}" + ("" if age is None or age < STALE_DAYS else f" (over {STALE_DAYS} days: advice given before this check could be stale)"))
     text, how = changelog_text()
     latest_cl, latest_npm = changelog_top(text), npm_latest()
-    latest = max([v for v in (latest_cl, latest_npm) if v], key=vtuple, default="")
+    latest = max([v for v in (latest_cl, latest_npm) if vkey(v)], key=vkey, default="")
     inst = new["claude"] or "?"
-    if latest:
-        state = "up to date" if vtuple(inst) >= vtuple(latest) else f"behind: {latest} is out"
-        print(f"  Claude Code: installed {inst}, latest {latest} ({state}; changelog top {latest_cl or '?'}, npm {latest_npm or 'unreachable'})")
+    src = f"changelog top {latest_cl or '?'}" + (f" ({how})" if how.startswith("OFFLINE") else "") + \
+          f", npm {latest_npm or 'unreachable'}"
+    if latest and vkey(inst) is None:
+        print(f"  Claude Code: installed version unknown (`claude --version` gave {inst!r}), latest {printable(latest)} ({printable(src)}). "
+              "Not compared: no guess made.")
+    elif latest:
+        state = "up to date" if vkey(inst) >= vkey(latest) else f"behind: {latest} is out"
+        print(f"  Claude Code: installed {printable(inst)}, latest {printable(latest)} ({state}; {printable(src)})")
     else:
-        print(f"  Claude Code: installed {inst}; latest unknown ({how}; npm unreachable). Offline: no guess made.")
+        print(f"  Claude Code: installed {printable(inst)}; latest unknown ({printable(how)}; npm unreachable). Offline: no guess made.")
     try:
         own = own_market_line(H.installed_plugins())
     except Exception:
         own = ""
     if own:
-        print(own)
+        print(printable(own))                   # thirty-sixth review: versions and dates from plugin state files
     print(f"  setup now: {len(new['skills'])} skill folders on disk (yours + enabled plugins + synced), {len(new['plugins'])} plugins,"
           f" {len(new['mcp'])} MCP servers/connectors, {len(new['hooks'])} hook commands"
-          + (f"; last snapshot {old.get('at', '')[:16].replace('T', ' ')}" if old else ""))
+          + (f"; last snapshot {printable(old.get('at'))[:16].replace('T', ' ')}" if old else ""))
     changes = diff(old, new) if old else []
     for c in changes:
-        print(f"  changed: {c}")
+        print(f"  changed: {printable(c)}")       # thirty-sixth review: names from disk and settings, safely
     if old and not changes:
         print("  no setup changes since the last snapshot")
     last = old.get("claude") if old else ""
     found = changelog_since(text, last, new["claude"]) if text else {}
-    print(f"  changelog ({how}): {'versions after ' + last if last else 'current version'}; lines about context, tokens, skills, hooks, MCP, agents, compaction, experiments/flags:")
+    print(f"  changelog ({printable(how)}): {'versions after ' + printable(last) if last else 'current version'}; lines about context, tokens, skills, hooks, MCP, agents, compaction, experiments/flags:")
     shown, known = 0, set()
     for ver in sorted(found, key=vtuple, reverse=True):
         for line in found[ver]:
             known.add(line[:60])
             if shown < 15:
-                print(f"    {ver}: {line[:150]}")
+                print(f"    {printable(ver)}: {printable(line[:150])}")   # thirty-sixth review: fetched text, safely
                 shown += 1
     if not found:
         print("    none" if text else "    changelog not reachable and no cached copy; rerun online")
@@ -243,7 +271,7 @@ def cmd_fresh(cwd=None):
     if ok:
         print(f"  release notes (Anthropic docs): reachable; {len(notes)} topic line(s) not already in the changelog" + (":" if notes else ""))
         for l in notes[:6]:
-            print(f"    {l[:150]}")
+            print(f"    {printable(l[:150])}")
     else:
         print("  release notes (Anthropic docs): not reachable now; not guessed")
     print("  native-first map (Big Dad part | native lever | surfaces with the lever | verdict):")

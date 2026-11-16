@@ -16,7 +16,7 @@ import bd_common as C
 
 
 def totals(path):
-    """calls, total input tokens, last call input, model, max output tokens: one pass over the agent transcript."""
+    """calls, total input tokens, last call input, model: one pass over the agent transcript."""
     calls = total = last = 0
     model = ""
     seen = set()
@@ -25,26 +25,31 @@ def totals(path):
             for line in f:
                 if '"usage"' not in line:
                     continue
-                try:
-                    d = json.loads(line)
-                except ValueError:
+                try:                         # 3.0.0 twenty-second review: a row that cannot be read is skipped
+                    d = json.loads(line)     # whole (an unhashable id: TypeError) and the loop goes on
+                    m = d.get("message") if isinstance(d, dict) else None
+                    if not isinstance(m, dict):
+                        continue
+                    u = m.get("usage")
+                    mid = m.get("id")
+                    if not isinstance(u, dict) or (mid is not None and mid in seen):
+                        continue
+                    # fortieth review: a bool is not a count (True summed as 1)
+                    n = sum(u.get(k) for k in ("input_tokens", "cache_creation_input_tokens",
+                                               "cache_read_input_tokens") if type(u.get(k)) is int)
+                    # thirty-ninth review: only a row with counts marks its id (a damaged first block no longer
+                    # hides the good block of the same id); fortieth review: counts above 0 (a negative sum was kept)
+                    if mid is not None and n > 0:   # 3.0.0 twenty-first review: an id-less call is never a duplicate
+                        seen.add(mid)
+                except (TypeError, AttributeError, ValueError, RecursionError):
                     continue
-                m = d.get("message") if isinstance(d, dict) else None
-                if not isinstance(m, dict):
-                    continue
-                u = m.get("usage")
-                if not isinstance(u, dict) or m.get("id") in seen:
-                    continue
-                seen.add(m.get("id"))
-                n = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-                        if isinstance(u.get(k), int))
-                if not n:
+                if n <= 0:
                     continue
                 calls += 1
                 total += n
                 last = n
                 model = C.dstr(m.get("model")) or model
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError):   # the file itself (a path open() rejects: TypeError / ValueError)
         pass
     return calls, total, last, model
 
@@ -67,6 +72,11 @@ def main():
         row["event"] = "stop"
         calls, total, last, model = totals(C.dstr(event.get("agent_transcript_path")))
         row.update({"calls": calls, "input_total": total, "last_call": last, "model": model})
+        q = C.last_quit(C.dstr(event.get("agent_transcript_path")))
+        if q:                          # 3.0.0: it ended on a failed call (limit, login, credits, connection)
+            row["quit"] = q["kind"]
+            if q.get("resets_at") is not None:   # already a usable time or None (C.reset_at in quit_row); kept for
+                row["resets_at"] = q["resets_at"]  # outside readers: nothing in Big Dad reads it back
         relaunch(event, agent, row)
     else:
         row["event"] = "start"
@@ -92,7 +102,7 @@ def relaunch(event, agent, row):
     except OSError:
         return                         # another copy of the hook got it first
     kind = row["agent_type"] if row["agent_type"] != "?" else C.dstr(st.get("type")) or "agent"
-    cap = st.get("cap") if isinstance(st.get("cap"), int) else C.stop_cap()
+    cap = C.sane(st.get("cap"), whole=True) or C.stop_cap()   # 32nd review: a bool, 0 or huge cap: today's cap
     calls, total = row.get("calls") or 0, row.get("input_total") or 0
     if not calls:                      # no transcript path on the event: find the agent's own file
         try:
@@ -116,7 +126,7 @@ def started(log, row):
             continue
         try:
             d = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(d, dict) and d.get("event") == "start" and (d.get("agent_id"), d.get("session")) == (row["agent_id"], row["session"]):
             return True
@@ -130,15 +140,15 @@ def duplicate(log, row):
     for line in reversed(C.tail_text(log, 16_000).splitlines()):
         try:
             d = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(d, dict) or (d.get("agent_id"), d.get("event"), d.get("session")) != (row["agent_id"], row["event"], row["session"]):
             continue
         try:
             if now - time.mktime(time.strptime(C.dstr(d.get("ts")), "%Y-%m-%dT%H:%M:%S")) <= 5:
                 return True
-        except ValueError:
-            return True
+        except (ValueError, OverflowError, OSError):   # thirty-first review: a year mktime can't take raised
+            return True                                # OverflowError; fortieth review: OSError too, as stale()
     return False
 
 

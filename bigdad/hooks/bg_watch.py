@@ -62,8 +62,8 @@ def size_note(event):
             prev = files.get(key) if isinstance(files.get(key), dict) else None
             seen = prev.get("seen", 0) if prev else 0
             noted = prev.get("noted", 0) if prev else 0
-            seen = seen if isinstance(seen, int) else 0
-            noted = noted if isinstance(noted, int) else 0
+            seen = C.sane(seen, whole=True)     # thirty-second review: a bool, huge or negative size reads as 0
+            noted = C.sane(noted, whole=True)
             if prev and size >= MIN_BYTES and size > seen and size >= 2 * noted:
                 name = os.path.basename(p)
                 notes.append(f"🥛 Big Dad: {name} (a background job's output) grew to ~{size // 4:,} tokens and each "

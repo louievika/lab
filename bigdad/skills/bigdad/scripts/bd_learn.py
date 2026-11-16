@@ -80,7 +80,7 @@ def tally():
             for line in f:
                 try:
                     k = json.loads(line).get("k")
-                except (ValueError, AttributeError):
+                except (ValueError, AttributeError, RecursionError):
                     continue
                 if isinstance(k, str):
                     seen[k] = seen.get(k, 0) + 1
@@ -99,8 +99,10 @@ def seen_text(seen):
 
 
 def line(b, seen):
-    text = (f"🥛 Big Dad has its baseline: {plural(b.get('chats', 0), 'chat')}, {b.get('calls', 0):,} calls counted. "
-            "It is on now.")
+    # thirty-second review: every number here goes through C.sane, so a damaged baseline.json cannot raise in the
+    # formatting (a str chats once did, after the learning flag was gone, and the one "it is on" line was lost)
+    text = (f"🥛 Big Dad has its baseline: {plural(C.sane(b.get('chats'), whole=True), 'chat')}, "
+            f"{C.sane(b.get('calls'), whole=True):,} calls counted. It is on now.")
     s = seen_text(seen)
     if s:
         text += f" While learning it only watched (observed, nothing changed): {s}."
@@ -114,23 +116,36 @@ def end_if_ready():
     import bd_baseline as B
     import bd_setup as S
     b = B.load()
-    if not b or b.get("watching") or not isinstance(b.get("calls"), int) or b["calls"] < min_calls() \
-            or not os.path.exists(S.PROFILE):
+    if not isinstance(b, dict) or b.get("watching"):
         return None
-    try:
-        C.remove_file(_p("learning"))  # first: a flag held open elsewhere (Windows) means try again next refresh,
+    calls = b.get("calls")             # past NUM_TOP, a bool or a float: not ready (32nd review)
+    if not C.sane_ok(calls, whole=True) or calls < min_calls() or not os.path.exists(S.PROFILE):
+        return None
+
+    def built():
+        seen = tally()
+        st = state()
+        st.update({"state": "on", "ended": C.now(), "chats": C.sane(b.get("chats"), whole=True), "calls": calls,
+                   "seen": seen})
+        return line(b, seen), st
+
+    text, st = built()                 # built before the flag goes: proves they can be, so nothing after the
+    try:                               # removal can raise and lose the one "it is on" line
+        C.remove_file(_p("learning"))  # a flag held open elsewhere (Windows) means try again next refresh,
     except OSError:                    # not a second "it is on" line (and a refresh racing us gets here second)
         return None
-    seen = tally()
-    text = line(b, seen)
-    st = state()
-    st.update({"state": "on", "ended": C.now(), "chats": b.get("chats", 0), "calls": b["calls"], "seen": seen})
-    _save(st)
+    try:                               # thirty-third review: counted again now the flag is gone, so rows other
+        text, st = built()             # sessions' hooks appended since the first count are in the line (the file
+    except Exception:                  # is deleted below); if that fails, the first build stands
+        pass
+    # thirty-fourth review: still open, a short window: a hook that checked C.learning() before the removal and
+    # appends its row after this recount is not in the line (the file goes below). Closing it needs a lock.
     try:
         with open(_p("learned"), "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(text)              # the line first, then learn.json; each survives the other failing
     except OSError:
         pass
+    _save(st)
     try:
         C.remove_file(_p("learn-seen.jsonl"))
     except OSError:

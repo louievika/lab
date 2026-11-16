@@ -21,8 +21,9 @@ How a run is isolated (all of it checked, not assumed):
   - auth: only the `claudeAiOauth` block of ~/.claude/.credentials.json, WITHOUT its refreshToken (measured
     2026-11-10, Claude Code 2.1.319: a headless run works on the access token alone), is written into the temp
     config dir right before the run and deleted right after (finally, plus atexit and SIGTERM for a crash or a
-    kill; sweep_logins at the next start for a hard kill), never printed. On Windows the copy gets one ACL entry,
-    this user (make_private), before the token is written; if that fails the run is refused. A copy that can't
+    kill; sweep_logins at the next start for a hard kill, which deletes only copies Auth made and leaves any other
+    file of that name), never printed. On Windows the copy gets one ACL entry, this user (make_private), before
+    the token is written; if that fails the run is refused. A copy that can't
     be deleted stays listed and is reported, never counted as gone. A run is refused when the access token
     expires within REFRESH_MARGIN, so it can't run out mid-call (with no refresh token there is nothing to refresh,
     so the real login can never be rotated from a temp dir).
@@ -30,7 +31,11 @@ How a run is isolated (all of it checked, not assumed):
     (plus exactly the bigdad plugin and its skill in the Big Dad arm); no hook may run in the native arm; the
     transcript is scanned for the owner's own skill/plugin names and CLAUDE.md headings.
 """
-import atexit, glob, hashlib, json, os, re, signal, subprocess, threading, time
+import atexit, glob, hashlib, json, os, re, signal, stat, subprocess, sys, threading, time
+
+_HOOKS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "hooks"))
+sys.path.insert(0, _HOOKS)            # the settled rule, as every script: its own bd_common always wins
+from bd_common import pause_steps  # noqa: E402  open_wait's steps; bd_common has no import-time effects
 
 REFRESH_MARGIN = 20 * 60                      # seconds of token life a run needs
 STRIP = ("CLAUDE", "ANTHROPIC", "BIGDAD", "MCP", "AI_AGENT")   # never passed, even if named in ENV_KEEP
@@ -180,6 +185,22 @@ def _remove_login(p):
     return gone
 
 
+OWN_WAIT = 2.5   # s: the most Auth waits for its own earlier copy to go (as bd_common.COMMAND_WAIT for a command)
+
+
+def _remove_own_login(p):
+    """_remove_login for a copy this process made, waiting out a short hold (Windows: a virus scan or the indexer
+    still has it open just after a run) in the same steps as bd_common.open_wait: 0.02, 0.04, 0.06, 0.08 s, then
+    0.1 s each, OWN_WAIT s in all (bd_common.pause_steps). True when it is gone."""
+    if _remove_login(p):
+        return True
+    for pause in pause_steps(OWN_WAIT):
+        time.sleep(pause)
+        if _remove_login(p):
+            return True
+    return False
+
+
 atexit.register(_drop_live)
 
 
@@ -200,18 +221,65 @@ def _hook_term():
         pass
 
 
-def sweep_logins(root):
-    """Delete every login copy under a run root (a run killed hard last time); every copy it found, deleted or
-    not. logins_stuck(found) is the ones still on disk."""
+def made_by_auth(p):
+    """True when p is a login copy Auth wrote: listed by this process, or a plain file holding exactly what Auth
+    writes (nothing yet: a run killed between the create and the write; or a JSON object whose only key is
+    claudeAiOauth, with no refreshToken). A real login (it has a refresh token), a link or anything else is not."""
+    with _LIVE_LOCK:
+        if p in _LIVE:
+            return True
+    try:
+        st = os.lstat(p)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+            return False
+        with open(p, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    if not raw:
+        return True
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return False
+    o = d.get("claudeAiOauth") if isinstance(d, dict) else None
+    return isinstance(o, dict) and list(d) == ["claudeAiOauth"] and "refreshToken" not in o
+
+
+def sweep_logins(root, others=None):
+    """Delete the login copies Auth made under a run root (a run killed hard last time); every copy it found,
+    deleted or not. logins_stuck(found) is the ones still on disk. A file of that name Auth did not make is left as
+    it was and only added to others (a list) when one is given, for the caller's one line."""
     found = []
     if not root or not os.path.isdir(root):
         return found
     for r, _, files in os.walk(root):
         if ".credentials.json" in files:
             p = os.path.join(r, ".credentials.json")
+            if not made_by_auth(p):
+                if others is not None:
+                    others.append(p)
+                continue
             found.append(p)
             _remove_login(p)
     return found
+
+
+def others_line(others, where):
+    """The one line a caller prints for files named .credentials.json that Big Dad did not make (None: none)."""
+    if not others:
+        return None
+    return (f"{len(others)} file(s) named .credentials.json under {where} were not made by Big Dad; left as they "
+            f"were: {', '.join(others[:3])}{' ...' if len(others) > 3 else ''}")
+
+
+def drop_login(cfg):
+    """Try once more to delete the login copy in cfg, only when this process made it (a file it did not make, which
+    Auth refused to write over, stays)."""
+    p = os.path.join(cfg, ".credentials.json")
+    with _LIVE_LOCK:
+        ours = p in _LIVE
+    return _remove_login(p) if ours else not os.path.exists(p)
 
 
 def logins_stuck(paths):
@@ -221,28 +289,56 @@ def logins_stuck(paths):
 
 class Auth:
     """with Auth(cfg): the auth file exists in cfg only inside the block (and is removed at exit if the block never
-    got to its end)."""
-    def __init__(self, cfg, block):
-        self.path = os.path.join(cfg, ".credentials.json")
+    got to its end). The file is created new (O_EXCL, O_NOFOLLOW where there is one): anything already at the path
+    (a file, a symlink, a dangling link, a folder) refuses the run and is left as it was, never written or deleted.
+    A copy a killed run left behind is the caller's to sweep first (sweep_logins), as bench and versus do. This
+    process's own earlier copy (listed in _LIVE) that Windows still held is waited out for up to OWN_WAIT s first."""
+    def __init__(self, cfg, block, src=None):
+        self.path, self.src = os.path.join(cfg, ".credentials.json"), src
         o = block.get("claudeAiOauth") if isinstance(block, dict) else None
         self.block = {"claudeAiOauth": {k: v for k, v in o.items() if k != "refreshToken"}} if isinstance(o, dict) else block
 
     def __enter__(self):
         exp = (self.block.get("claudeAiOauth") or {}).get("expiresAt") if isinstance(self.block, dict) else None
         if isinstance(exp, (int, float)) and exp / 1000 - time.time() < REFRESH_MARGIN:
-            self.block = auth_block()         # re-read the real login (it may have refreshed); raises if still short
+            self.block = auth_block(self.src)  # re-read the real login (it may have refreshed); raises if still short
         _hook_term()
         with _LIVE_LOCK:
+            ours = self.path in _LIVE
+        if ours:                              # our own copy an earlier block of this process could not delete:
+            _remove_own_login(self.path)      # waited out for a moment (Windows holds it briefly), never longer
+        taken = (f"something is already at {self.path}; left untouched (sweep a killed run's login copy first)")
+        # Windows has no O_NOFOLLOW, and its CREATE_NEW (what O_EXCL maps to) follows a dangling symlink and makes
+        # the target (measured 2026-11-13): so look first, and after the open check the path is the plain file we got
+        if os.path.lexists(self.path):
+            raise RuntimeError(taken)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as e:
+            if os.path.lexists(self.path):
+                raise RuntimeError(taken) from e
+            raise
+        try:
+            st = os.lstat(self.path)
+            mine = not stat.S_ISLNK(st.st_mode) and os.path.samestat(st, os.fstat(fd))
+        except OSError:
+            mine = False
+        if not mine:                          # lost a race to a link: nothing written, nothing deleted
+            os.close(fd)
+            raise RuntimeError(taken)
+        with _LIVE_LOCK:                      # ours only now: clean-up never deletes a file we did not make
             _LIVE.add(self.path)
-        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         try:
             make_private(self.path)           # before one byte of the token is in it
-        except Exception:
-            os.close(fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = None
+                json.dump(self.block, f)
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
             _remove_login(self.path)
             raise
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(self.block, f)
         return self
 
     def __exit__(self, *a):
@@ -256,7 +352,7 @@ def markers(home=None):
     c = os.path.join(home, ".claude")
     names = set()
     for pat in ("skills/*", "skills-off/*", "agents/*.md", "plugins/cache/*/*", "plugins/synced/*/*.meta.json"):
-        for p in glob.glob(os.path.join(c, pat)):
+        for p in glob.glob(os.path.join(glob.escape(c), pat)):
             n = os.path.basename(p)
             for suf in (".meta.json", ".md"):
                 n = n[: -len(suf)] if n.endswith(suf) else n

@@ -194,7 +194,7 @@ def older_asks(path, tail, rows, cap=96 << 20, chunk=4 << 20):
                     continue
                 try:
                     d = json.loads(line.decode("utf-8", "replace"))
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if isinstance(d, dict) and prompt_text(d):
                     found.append(d)

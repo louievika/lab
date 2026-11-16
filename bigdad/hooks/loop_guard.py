@@ -32,29 +32,49 @@ def recent_calls(path, n=WINDOW, ids=None):
         if '"tool_use"' not in line:
             continue
         try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        m = d.get("message") if isinstance(d, dict) else None
-        if d.get("type") != "assistant" or not isinstance(m, dict) or not isinstance(m.get("content"), list):
-            continue
-        for b in reversed(m["content"]):
-            if isinstance(b, dict) and b.get("type") == "tool_use":
-                key = (C.dstr(m.get("id")), C.dstr(b.get("id")))
-                if all(key) and key in seen:                 # the same message logged twice is not a repeat
-                    continue
-                seen.add(key)
-                if C.dstr(b.get("name")) in EDITS:
-                    return out              # something changed: repeats before this edit aren't a loop
-                try:
-                    out.append(key_of(b.get("name"), b.get("input")))
-                    if ids is not None:
-                        ids.add(C.dstr(b.get("id")))
-                except (TypeError, ValueError):
-                    continue
-                if len(out) >= n:
-                    return out
+            keys, got, tids, stop = _row_calls(line, seen, n - len(out))
+        except C.ODD_ROW:
+            continue                        # 3.0.0 fifteenth review: a row that cannot be read: skipped whole
+        seen.update(keys)                   # only now is anything counted
+        out.extend(got)
+        if ids is not None:
+            ids.update(tids)
+        if stop or len(out) >= n:
+            return out
     return out
+
+
+def _row_calls(line, seen, room):
+    """One transcript line of recent_calls, read whole before anything is counted: (keys it adds to seen, its calls
+    newest first, their tool_use ids, stop) with stop True at an edit (repeats before it are not a loop). At most
+    room calls."""
+    keys, got, tids = set(), [], []
+    try:
+        d = json.loads(line)
+    except (ValueError, RecursionError):
+        return keys, got, tids, False
+    if not isinstance(d, dict):            # 3.0.0 fourteenth review: a list, string or number line is skipped
+        return keys, got, tids, False
+    m = d.get("message")
+    if d.get("type") != "assistant" or not isinstance(m, dict) or not isinstance(m.get("content"), list):
+        return keys, got, tids, False
+    for b in reversed(m["content"]):
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            key = (C.dstr(m.get("id")), C.dstr(b.get("id")))
+            if all(key) and (key in seen or key in keys):    # the same message logged twice is not a repeat
+                continue
+            keys.add(key)
+            if C.dstr(b.get("name")) in EDITS:
+                return keys, got, tids, True    # something changed: repeats before this edit aren't a loop
+            try:
+                k = key_of(b.get("name"), b.get("input"))
+            except (TypeError, ValueError, RecursionError):   # twentieth review: too deep for json.dumps
+                continue
+            got.append(k)
+            tids.append(C.dstr(b.get("id")))
+            if len(got) >= room:
+                break
+    return keys, got, tids, False
 
 
 def main(event=None, standalone=True):
@@ -93,11 +113,14 @@ def main(event=None, standalone=True):
     state = os.path.join(C.state_dir(), f"bigdad-loop-{sid}-{agent or 'main'}.json")
     h = hashlib.sha1((tool + inp).encode("utf-8", "replace")).hexdigest()[:12]
     try:
-        noted = json.load(open(state))
+        with open(state) as f:         # thirty-second review: closed at once, not left to the collector
+            noted = json.load(f)
         noted = noted if isinstance(noted, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         noted = {}
-    if n < (noted.get(h) or 0) + times:
+    # thirty-first review: a str or list here raised TypeError at + times; thirty-second: an infinite, huge or
+    # negative count (inf silenced this loop's note for good) reads as 0 too
+    if n < C.sane(noted.get(h)) + times:
         return                          # already said at this count; say it again after `times` more repeats
     noted[h] = n
     try:

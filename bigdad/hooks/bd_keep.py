@@ -35,7 +35,7 @@ def broken():
     try:
         with open(p, encoding="utf-8", errors="replace") as f:
             d = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return "keep.json is not valid JSON"
     return "" if isinstance(d, dict) else "keep.json is not a JSON object"
 
@@ -160,8 +160,10 @@ def cmd(rest):
         said_no = sum(1 for v in it.values() if v.get("by") == "said no")
         print(f"🥛 Big Dad keep list: {len(it)} kept (your choice)" + (f", {said_no} from a no" if said_no else ""))
         for key, v in sorted(it.items()):
-            why = f" · {v['why']}" if v.get("why") else ""
-            print(f"  ⭐ {v.get('name') or key} ({v.get('kind', 'any')}, {v.get('by', 'you')}){why}")
+            # thirty-sixth review: name, kind, by and why come from keep.json (a state file): printed safely
+            why = f" · {C.shown(str(v['why']))}" if v.get("why") else ""
+            print(f"  ⭐ {C.shown(str(v.get('name') or key))} ({C.shown(str(v.get('kind', 'any')))}, "
+                  f"{C.shown(str(v.get('by', 'you')))}){why}")
         print("  Kept items still show their cost, never as a cut. Undo one: bigdad.py keep --remove <x>")
         return
     if args[0] == "--remove":

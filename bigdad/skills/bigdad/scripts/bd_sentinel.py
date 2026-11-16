@@ -40,7 +40,7 @@ def read_settings():
     try:
         with open(p, encoding="utf-8", errors="replace") as f:
             d = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         return None, f"{p} is not valid JSON ({e.__class__.__name__}); fix it first, Big Dad won't rewrite it."
     if not isinstance(d, dict):
         return None, f"{p} is not a JSON object; Big Dad won't rewrite it."
@@ -216,7 +216,7 @@ def cmd_statusline(rest):
     try:
         with open(prev_file, encoding="utf-8", errors="replace") as f:
             old = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         pass
     if old:
         d["statusLine"] = old

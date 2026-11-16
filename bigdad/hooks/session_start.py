@@ -105,12 +105,29 @@ def version_note():
     return f"🥛 Big Dad: Claude Code changed ({last} → {now}): run `bigdad.py fresh`."
 
 
+def baseline_line(B, b):
+    """bd_baseline.one_line, or '' when baseline.json holds a field it can't print (thirty-first review: a missing
+    count, a str share or guide raised KeyError, ValueError or TypeError at every session start). On '' the short
+    line is shown instead and the baseline is not marked shown. Thirty-third review: B.printable first (a NaN, inf
+    or 7.5 share printed "nan%" or "750%" and was marked shown); the except stays as a second guard."""
+    try:
+        return B.one_line(b) if B.printable(b) else ""
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ""
+
+
 HOOKS = os.path.dirname(os.path.abspath(__file__))
 STABLE = ("sentinel.py", "run.sh")
 
 
-def mark_loaded(session=""):
-    """Record that the plugin's hooks ran (the sentinel compares this with its own last run)."""
+def mark_loaded(session="", fix=True):
+    """Record that the plugin's hooks ran (the sentinel compares this with its own last run). Not with a refused state
+    folder (3.0.0): then the hooks write nothing, and bd_dir() may be the folder another user can write (a planted
+    link at plugin-load.json.tmp, sentinel.py or run.sh would be followed). fix=False (BIGDAD_GUARD=off) only looks:
+    the state folder is not made or tightened (an open one we own is not refused, the hooks tighten it)."""
+    why = C.state_problem(fix)
+    if why and not why.endswith(C.TIGHTEN):
+        return
     root = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(HOOKS)
     meta = C.load_json(os.path.join(os.path.dirname(HOOKS), ".claude-plugin", "plugin.json"))
     row = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), "version": C.dstr(meta.get("version")),
@@ -139,11 +156,16 @@ def mark_loaded(session=""):
 
 def main(event=None, standalone=True):
     if C.off("BIGDAD_GUARD"):
-        mark_loaded()                  # off on purpose is still "loaded": the sentinel must not cry wolf
+        mark_loaded(fix=False)         # off on purpose is still "loaded": the sentinel must not cry wolf; only looks
         return
-    event = C.read_event() if event is None else event
+    event = C.read_event(need_state=False) if event is None else event
     if event is None:
         mark_loaded()
+        return
+    if C.state_problem():              # 2.0.9: no private state folder; the other hooks stay idle, so say why, once here
+        mark_loaded(C.dstr(event.get("session_id")))
+        if (C.dstr(event.get("source")) or "startup") in ("startup", "resume"):   # 3.0.0 review: not again on
+            return C.emit({"systemMessage": C.idle_line()}, standalone)        # every /clear and compact
         return
     source = C.dstr(event.get("source")) or "startup"
     mark_loaded(C.dstr(event.get("session_id")))
@@ -186,13 +208,16 @@ def main(event=None, standalone=True):
         if learn:
             bd_learn.end_if_ready()
             told = C.learned_note()
+        learning = not told and learn and C.learning()
+        # thirty-second review: the baseline line is worked out once, only when it would be shown
+        line = baseline_line(B, b) if not told and not learning and b and not b.get("shown") else ""
         if told:
             out["systemMessage"] = told
-        elif learn and C.learning():
+        elif learning:
             out["systemMessage"] = (f"🥛 Big Dad is learning first: it watches and counts, and changes nothing until "
                                     f"your baseline covers {bd_learn.min_calls()} calls; one line says when it is on.")
-        elif b and not b.get("shown"):
-            out["systemMessage"] = B.one_line(b)
+        elif line:
+            out["systemMessage"] = line
             if not b.get("watching"):
                 b["shown"] = True
                 try:
@@ -204,9 +229,12 @@ def main(event=None, standalone=True):
                                     "background; it shows at your next session start (or run `bigdad.py baseline`).")
         else:
             guide = f"guide {limit // 1000}k/call ({C.guard_source()})"
-            out["systemMessage"] = (f"🥛 Big Dad on · {guide}{on} · baseline 🧾 "
-                                    f"{b.get('resent_share', 0):.0%} re-sent" if not b.get("watching") else
-                                    f"🥛 Big Dad on · {guide} · watching first")
+            share = b.get("resent_share", 0)   # 31st review: a str raised ValueError at :.0%; 33rd: a share, 0..1
+            share = share if B.share_ok(share) else None
+            out["systemMessage"] = (f"🥛 Big Dad on · {guide} · watching first" if b.get("watching") else
+                                    f"🥛 Big Dad on · {guide}{on} · baseline 🧾 {share:.0%} re-sent"
+                                    if share is not None else
+                                    f"🥛 Big Dad on · {guide}{on}")
         try:
             import bd_settle
             grew = bd_settle.unshown_line()

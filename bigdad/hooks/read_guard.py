@@ -17,7 +17,12 @@ file and range while the first copy is still in context and the file hasn't chan
     Read view also numbers a trailing empty line, so its total is one over `wc -l`; the deny says so).
   - Same read asked for twice in a row: the second ask is allowed, so the guard can never
     lock the agent out of a file it really needs again.
-  - After /compact (or auto-compact) the session forgets what it read, so the slate is wiped.
+  - After /compact (or auto-compact) the session forgets what it read, so the slate is wiped. 3.0.0: Claude Code may
+    leave agent_id out of an agent's compact event, so before any block the guard also looks in this context's own
+    log (the agent's, never the parent's) for a compact_boundary written after the read was recorded ("at", the log's
+    byte size at PostToolUse). Found: the records older than it are dropped and the read goes through.
+  - Every block appends one row to bd_dir()/blocks.jsonl (ts, session, agent, file name, kind read|cover|bash,
+    tokens the block kept out of context), like outlines.jsonl. Nothing adds these rows into a total.
   - Images, PDFs (per pages value) and notebooks are recorded too (v1.7 R1), so an unchanged one isn't sent twice.
   - State writes merge one key under a short lock and land with an atomic rename, so parallel Reads in one
     batch never drop each other's keys; a lock held past 200 ms makes the hook give up silently (fail open).
@@ -51,7 +56,7 @@ def load(path):
         with open(path, encoding="utf-8", errors="replace") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 
@@ -138,7 +143,7 @@ def read_key(args):
         return None
     try:
         key = json.dumps([os.path.normcase(os.path.abspath(fp)), args.get("offset"), args.get("limit"), args.get("pages")])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):   # twentieth review: too deep for json.dumps
         return None
     return key, fp, [st.st_mtime_ns, st.st_size]
 
@@ -209,7 +214,7 @@ def covering(seen, args, path_norm, stamp):
             continue
         try:
             kp = json.loads(k)[0]
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, TypeError, IndexError, RecursionError):
             continue
         if kp != path_norm or not isinstance(v.get("first"), int) or not isinstance(v.get("last"), int) or not v["last"]:
             continue
@@ -270,12 +275,88 @@ def deny_text(name, view, args):
             "(scroll back), or read only the lines you still need with offset/limit." + tail)
 
 
+def own_log(event):
+    """This context's own transcript: the helper's log for an agent call (never the parent's), else the chat's."""
+    path = C.dstr(event.get("transcript_path"))
+    agent = C.dstr(event.get("agent_id"))
+    if not agent:
+        return path
+    try:
+        import context_guard
+        return context_guard.agent_transcript(event, path, C.dstr(event.get("session_id")) or "x", agent, workflows=True)
+    except Exception:
+        return ""
+
+
+def log_at(event):
+    """The own log's byte size now (one stat), kept on a record as "at"; None when there is no log to measure."""
+    try:
+        return os.path.getsize(own_log(event))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def last_boundary(path, offset):
+    """Byte offset of the newest compact_boundary row past `offset` in the log, else None (same row test as
+    bd_common.boundary_after: a JSON row of type "system", subtype "compact_boundary")."""
+    found, pos = None, offset
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for line in f:
+            if b'"compact_boundary"' in line and b'"subtype"' in line:
+                try:
+                    row = json.loads(line.decode("utf-8", "replace"))
+                except (ValueError, RecursionError):
+                    row = None
+                if isinstance(row, dict) and row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+                    found = pos
+            pos += len(line)
+    return found
+
+
+def compacted(event, state, entries):
+    """Second compact signal (3.0.0), checked only right before a block: True when this context's own log has a
+    compact_boundary written after one of `entries` was recorded (or the log got shorter), so its copy may be gone.
+    Then every record older than that boundary is dropped. Any error: False (the old behaviour, PreCompact only)."""
+    try:
+        ats = [e.get("at") for e in entries if isinstance(e, dict)]
+        ats = [a for a in ats if C.sane_ok(a, whole=True)]   # 32nd review: in range too
+        if not ats:
+            return False
+        path = own_log(event)
+        if not path:
+            return False
+        size, lo = os.path.getsize(path), min(ats)
+        cut = sys.maxsize if size < lo else last_boundary(path, lo)
+        if cut is None:
+            return False
+
+        def drop(cur):
+            for k in [k for k, v in cur.items() if not (isinstance(v, dict)   # 32nd review: a huge "at" is dropped too
+                                                       and C.sane(v.get("at"), -1, whole=True) > cut)]:
+                del cur[k]
+        update(state, drop)
+        return True
+    except Exception:
+        return False
+
+
+def log_block(event, kind, name, tokens):
+    """One row per block (3.0.0), so blocks can be counted without the transcripts. One append, no reads."""
+    try:
+        C.append_jsonl(os.path.join(C.bd_dir(), "blocks.jsonl"),
+                       {"ts": C.now(), "session": (C.dstr(event.get("session_id")) or "x")[:8],
+                        "agent": C.dstr(event.get("agent_id"))[:17], "file": name, "kind": kind, "tokens": int(tokens)})
+    except Exception:
+        pass
+
+
 def copy_tokens(entry, stamp):
     """Tokens the earlier copy put in context: measured at PostToolUse (tok), else the file size / 4."""
     tok = entry.get("tok") if isinstance(entry, dict) else None
-    if isinstance(tok, int) and not isinstance(tok, bool) and tok >= 0:
+    if C.sane_ok(tok, whole=True):      # thirty-second review: a huge count reads as not measured
         return tok
-    return (stamp[1] if isinstance(stamp, list) and len(stamp) == 2 and isinstance(stamp[1], int) else 0) // 4
+    return C.sane(stamp[1] if isinstance(stamp, list) and len(stamp) == 2 else 0, whole=True) // 4
 
 
 def floor_lets_through(event, tokens):
@@ -460,10 +541,14 @@ def bash_after(event, state):
     total = C.est_tokens(event.get("tool_response"))[0]
     stamps = [(p, r, _stamp(p)) for p, r in dump]
     sizes = sum(s[1] for _, _, s in stamps if s) or 1
+    at = log_at(event)
     for p, r, stamp in stamps:                # each file's share of the output by its size, not an even split
         if stamp:
             tok = total if len(dump) == 1 else max(total * stamp[1] // sizes, stamp[1] // 4)
-            put(state, bash_key(p, r), {"stamp": stamp, "seen": True, "tok": tok})
+            entry = {"stamp": stamp, "seen": True, "tok": tok}
+            if at is not None:
+                entry["at"] = at
+            put(state, bash_key(p, r), entry)
 
 
 def bash_text(names, how):
@@ -480,7 +565,7 @@ def bash_pre(event, state, standalone):
     if not dump:
         return
     seen = load(state)
-    hows, marks, tokens = [], [], 0
+    hows, marks, tokens, used = [], [], 0, []
     for p, r in dump:
         stamp = _stamp(p)
         if stamp is None:
@@ -492,6 +577,7 @@ def bash_pre(event, state, standalone):
         if mine.get("seen") and mine.get("stamp") == stamp:
             hows.append("same " + r + " output")
             tokens += copy_tokens(mine, stamp)
+            used.append(mine)
         else:
             rd = seen.get(json.dumps([p, None, None, None]))
             if not (isinstance(rd, dict) and rd.get("seen") and rd.get("stamp") == stamp and not rd.get("partial")
@@ -499,9 +585,12 @@ def bash_pre(event, state, standalone):
                 return
             hows.append("in full from your Read")
             tokens += copy_tokens(rd, stamp)
+            used.append(rd)
         marks.append((bk, stamp))
     if floor_lets_through(event, tokens):
         return                                       # a helper's small re-dump: through (helper size floor)
+    if compacted(event, state, used):
+        return                                       # compacted since: the copy may be gone, through
     if C.learning():
         C.learn_seen("second_read")                  # learning first (2.0.6): counted, not blocked
         return
@@ -515,6 +604,7 @@ def bash_pre(event, state, standalone):
                 cur[bk] = {"stamp": stamp, "cover_blocked": stamp}
     update(state, mark)
     names = ", ".join(dict.fromkeys(os.path.basename(p) or p for p, _ in dump))
+    log_block(event, "bash", names, tokens)
     return C.emit({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
@@ -545,6 +635,9 @@ def after(event):
             return
         entry = {"stamp": stamp, "seen": True, "first": 1, "last": 0, "partial": False, "kind": kind,
                  "tok": C.est_tokens(resp)[0]}
+    at = log_at(event)
+    if at is not None:
+        entry["at"] = at                       # where this context's own log stood: a boundary past it = compacted
     sid = C.dstr(event.get("session_id")) or "x"
     put(state_path(f"{sid}-{C.dstr(event.get('agent_id')) or 'main'}"), key, entry)
 
@@ -578,7 +671,7 @@ def main(event=None, standalone=True):
     seen = load(state)
     prev = seen.get(key)
     if (isinstance(prev, dict) and prev.get("seen") and prev.get("stamp") == stamp and not prev.get("blocked")
-            and not floor_lets_through(event, copy_tokens(prev, stamp))):
+            and not floor_lets_through(event, copy_tokens(prev, stamp)) and not compacted(event, state, [prev])):
         if C.learning():
             C.learn_seen("second_read")              # learning first (2.0.6): counted, not blocked
             return
@@ -589,6 +682,7 @@ def main(event=None, standalone=True):
                 return False
             e["blocked"] = True
         update(state, mark)
+        log_block(event, "read", os.path.basename(fp) or fp, copy_tokens(prev, stamp))
         return C.emit({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
@@ -598,16 +692,20 @@ def main(event=None, standalone=True):
     if not mine.get("seen") and mine.get("cover_blocked") != stamp:
         try:
             path_norm = json.loads(key)[0]
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, TypeError, IndexError, RecursionError):
             path_norm = None
         cov = covering(seen, args, path_norm, stamp) if path_norm else None
-        if cov is not None and floor_lets_through(event, range_tokens(cov, args, stamp, fp)):
+        ctok = range_tokens(cov, args, stamp, fp) if cov is not None else 0
+        if cov is not None and floor_lets_through(event, ctok):
             cov = None                                  # a helper's small re-read: through (helper size floor)
+        if cov is not None and compacted(event, state, [cov]):
+            cov = None                                  # compacted since: the copy may be gone, through
         if cov is not None and C.learning():
             C.learn_seen("second_read")              # learning first (2.0.6): counted, not blocked
             return
         if cov is not None:
             put(state, key, {"stamp": stamp, "cover_blocked": stamp}, keep_seen=True)   # asked again on purpose: through
+            log_block(event, "cover", os.path.basename(fp) or fp, ctok)
             return C.emit({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",

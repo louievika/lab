@@ -33,7 +33,7 @@ def text_of(content):
         return "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
     try:
         return json.dumps(content or "")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):   # twentieth review: too deep for json.dumps
         return ""
 
 
@@ -56,18 +56,16 @@ def scan(path, keep=None):
     """Walk the transcript since the last compact boundary (within its tail). keep: a list that gets the rows."""
     rows, done = [], set()
     for line in _lines(path):
-        if '"compact_boundary"' in line and '"subtype"' in line:
-            try:
-                if json.loads(line).get("subtype") == "compact_boundary":
-                    rows, done = [], set()
-                    continue
-            except (ValueError, AttributeError):
-                pass
         try:
-            d = json.loads(line)
-        except ValueError:
+            d = json.loads(line)                   # 3.0.0 fourteenth review: each line parsed once
+        except (ValueError, RecursionError):
             continue
-        if not isinstance(d, dict) or d.get("type") == "api-request-blob":    # a copy of rows already seen
+        if not isinstance(d, dict):
+            continue
+        if '"compact_boundary"' in line and '"subtype"' in line and d.get("subtype") == "compact_boundary":
+            rows, done = [], set()
+            continue
+        if d.get("type") == "api-request-blob":    # a copy of rows already seen
             continue
         if "<task-id>" in line:
             for tid, status in re.findall(r"<task-id>(\w+)</task-id>.*?<status>(\w+)</status>", line, re.S):
@@ -78,24 +76,43 @@ def scan(path, keep=None):
         keep[:] = rows
     calls, results, order, sizes = {}, {}, [], {}
     for i, d in enumerate(rows):
-        m = d.get("message")
-        content = m.get("content") if isinstance(m, dict) else None
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict):
-                continue
-            if c.get("type") == "tool_use":
-                if c.get("id") and c.get("id") in calls:                     # the same call logged twice: count it once
-                    continue
-                inp = c.get("input")
-                inp = inp if isinstance(inp, dict) else {}
-                calls[c.get("id")] = (i, C.dstr(c.get("name")), inp, C.dstr(d.get("cwd")))
-                order.append(c.get("id"))
-            elif c.get("type") == "tool_result":
-                results[c.get("tool_use_id")] = text_of(c.get("content"))
-                sizes[c.get("tool_use_id")] = C.est(c.get("content"))[0]    # images as images, not base64
+        try:
+            new, res = _row_calls(i, d, calls)
+        except C.ODD_ROW:
+            continue                               # 3.0.0 fifteenth review: a row that cannot be read: skipped whole
+        for cid, v in new:                         # only now is anything counted
+            calls[cid] = v
+            order.append(cid)
+        for tid, text, size in res:
+            results[tid], sizes[tid] = text, size
     return calls, results, order, done, sizes
+
+
+def _row_calls(i, d, calls):
+    """Row i of scan, read whole before anything is counted: ([(tool_use id, call)], [(tool_use_id, text, size)]).
+    Raises on a value of the wrong kind (a list "id" or "tool_use_id", a "text" that is not a string...)."""
+    m = d.get("message")
+    content = m.get("content") if isinstance(m, dict) else None
+    new, res, ids = [], [], set()
+    if not isinstance(content, list):
+        return new, res
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "tool_use":
+            cid = c.get("id")
+            if cid and (cid in calls or cid in ids):                     # the same call logged twice: count it once
+                continue
+            ids.add(cid)      # seventeenth review: a list or dict id raises TypeError here or just above: row skipped
+            inp = c.get("input")
+            inp = inp if isinstance(inp, dict) else {}
+            new.append((cid, (i, C.dstr(c.get("name")), inp, C.dstr(d.get("cwd")))))
+        elif c.get("type") == "tool_result":
+            tid = c.get("tool_use_id")
+            if isinstance(tid, (list, dict)):
+                raise TypeError("a tool_use_id that cannot be a key")
+            res.append((tid, text_of(c.get("content")), C.est(c.get("content"))[0]))   # images as images, not base64
+    return new, res
 
 
 def _norm(p, cwd):
@@ -184,7 +201,7 @@ def plan(path, keep=None):
         if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
             try:
                 payload += len(json.dumps(inp))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):   # twentieth review: too deep for json.dumps
                 pass
         elif name == "Bash" and len(C.dstr(inp.get("command"))) > 1500:
             payload += len(inp["command"])

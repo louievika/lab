@@ -109,16 +109,17 @@ def unshown_line(s=None, mark=True):
             ". Look at what was added (`bigdad.py settle`, then `all`).") if parts else ""
 
 
-def _next_snapshot():
+def _next_snapshot(s=None):
     """Snapshots come from full baseline builds only (the in-between updates read just the new logs): say when the
-    next one is due, so 0 snapshots next to a working baseline is not read as a fault."""
+    next one is due, so 0 snapshots next to a working baseline is not read as a fault. s: the settle data the
+    command already loaded (settle.json is read once per command)."""
     try:
         import time
         import bd_baseline as B
         b = B.load()
         at = b.get("full_at") if b else None
         if b and not b.get("watching") and isinstance(at, (int, float)) and not isinstance(at, bool):
-            due = time.strftime("%Y-%m-%d", time.localtime(at + B.refresh_days() * 86400))
+            due = time.strftime("%Y-%m-%d", time.localtime(at + B.refresh_days(s) * 86400))
             return f"snapshots come from full baseline builds only; the next is due {due}"
     except Exception:
         pass
@@ -132,8 +133,9 @@ def lines(s):
     out.append(f"🥛 Big Dad settle · {n} of {len(AREAS)} settled · {len(s['history'])} snapshots · {due}")
     last = s["history"][-1] if s["history"] else {}
     empty = not s["history"] and not s["settled"]
+    why = None                         # the "no data" reason: read once per run, only if an area needs it
     if empty:
-        out.append(f"  no data   all {len(AREAS)} areas: {_next_snapshot()}")
+        out.append(f"  no data   all {len(AREAS)} areas: {_next_snapshot(s)}")
     for k, (label, _, _) in ([] if empty else AREAS.items()):
         st = s["settled"].get(k)
         if st:
@@ -144,7 +146,8 @@ def lines(s):
             was = f"{_fmt(k, prev)} -> " if prev is not None else ""
             out.append(f"  moving    {label}: {was}{_fmt(k, last[k])}: audit and cut here")
         else:
-            out.append(f"  no data   {label}: {_next_snapshot()}")
+            why = _next_snapshot(s) if why is None else why
+            out.append(f"  no data   {label}: {why}")
     for g in s.get("grew", [])[-3:]:
         if g.get("area") in AREAS:
             out.append(f"  grew back {AREAS[g['area']][0]}: {_fmt(g['area'], g['from'])} -> {_fmt(g['area'], g['to'])} "
