@@ -59,11 +59,43 @@ def _save(d):
             pass
 
 
+def decide(b):
+    """begin()'s decision, read only: None (BIGDAD_LEARN=off, or already decided in learn.json), "on" (a usable
+    baseline already there) or "learning"."""
+    if C.off("BIGDAD_LEARN") or state().get("state"):
+        return None
+    if b and not b.get("watching"):
+        return "on"
+    return "learning"
+
+
+def can_begin(source="startup", fix=True):
+    """session_start's gates before begin(), in its order: BIGDAD_GUARD on, a usable state folder (C.state_problem:
+    session_start returns early without one), a startup or /clear start, BIGDAD_BASELINE not off, BIGDAD_REFRESH and
+    BIGDAD_LEARN on. session_start reads its learning switch here, and would_begin() too, so they cannot drift (3.0.1,
+    second review: would_begin skipped the state-folder and source gates). fix=False only looks."""
+    return (not C.off("BIGDAD_GUARD") and not C.state_problem(fix) and source in ("startup", "clear")
+            and os.environ.get("BIGDAD_BASELINE") != "off" and not C.off("BIGDAD_REFRESH") and not C.off("BIGDAD_LEARN"))
+
+
+def would_begin():
+    """True when the next normal session start (a startup) would start learning: can_begin("startup") without
+    making anything, then decide() on the stored baseline. Writes nothing; any error: False."""
+    try:
+        if not can_begin("startup", fix=False):
+            return False
+        import bd_baseline as B
+        return decide(B.load()) == "learning"
+    except Exception:
+        return False
+
+
 def begin(b):
     """Session start: decide once. A usable baseline already there (an update from 2.0.5): on at once."""
-    if C.off("BIGDAD_LEARN") or state().get("state"):
+    d = decide(b)
+    if d is None:
         return
-    if b and not b.get("watching"):
+    if d == "on":
         _save({"state": "on", "at": C.now(), "why": "baseline already there"})
         return
     _save({"state": "learning", "since": C.now()})

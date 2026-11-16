@@ -3,7 +3,9 @@
 Each part runs in its own try/except, so one failing never blocks the other; outputs merge into one hook
 response. context_guard.py and watch.py still run on their own.
 2.0.6: while Big Dad learns first (bd_common.learning), at most every 2 minutes a refresh that ends learning once
-the data is in; then the one line that it is on (bd_common.learned_note), once."""
+the data is in; then the one line that it is on (bd_common.learned_note), once. Not in Big Dad's own headless
+runs (BIGDAD_PROBE=1: `proof read`, `probe`, `setup --measure`): the line stays for the next session that can show
+it. BIGDAD_GUARD=off (the user's switch) still shows it here, as in 3.0.0."""
 import os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -39,7 +41,7 @@ def main():
         except Exception:
             pass
     out = C.run_parts(parts, event)
-    told = C.learned_note()            # learning just ended: one line, once
+    told = C.learned_note()     # learning just ended: one line, once (none in Big Dad's own headless runs)
     if told:
         out = out if isinstance(out, dict) else {}
         out["systemMessage"] = (told + " " + out.get("systemMessage", "")).strip()

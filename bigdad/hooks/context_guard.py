@@ -6,9 +6,15 @@ last call in this session carried more than the per-call guide, it shows a one-l
 The guide is a cost guide (every call re-sends it all), not a documented limit. Default
 130k; after `bigdad.py setup` it is min(130k, ~65% of the user's real context window).
 It runs on your prompts and after each tool call, so it can warn mid-task too, and inside a
-subagent it reads the subagent's own transcript and warns that agent (and notes it for the
-parent in agents.jsonl). It warns again only when the load grows another 50%, and starts
-fresh after /compact (once a call drops back under the guide). It never blocks anything.
+subagent it reads the subagent's own transcript and warns that agent once at 85% of its guide
+(HEADSUP_AT, so it can finish its step and report back under the guide; noted for the parent in
+agents.jsonl). That heads-up latches as a note at the guide would (the next one at 1.5x the guide),
+so a helper sitting between 85% and its guide is told once; with `agent-stop` on, the stop's 80%
+note and the heads-up do not stack under the guide (whichever comes first is the one note; the
+other is held, never latched or marked as given). It warns again only when the load grows another
+50%, and starts fresh after /compact: the main chat and a helper told at or past its guide once a
+call drops back under the guide, a helper told by its heads-up once a call drops under 85% of it.
+It never blocks anything.
 
   BIGDAD_GUARD=off        turn it off
   BIGDAD_GUARD_AT=200000  change the guide (tokens per call)
@@ -272,17 +278,20 @@ def save_state(state, d):
 HANDOFF = C.HANDOFF                     # the five things every handoff ask names (bd_common)
 
 
-def soft_note(sid, agent, event, tokens, cap):
-    """One heads-up per agent at ~80% of the hard-stop cap: finish this step, get the handoff ready."""
-    if not (C.SOFT_AT * cap <= tokens < cap):
+def soft_note(state, agent, event, tokens, cap):
+    """One heads-up per agent at ~80% of the hard-stop cap: finish this step, get the handoff ready. Its once-only
+    latch is "soft" in the agent's guard state (3.0.1, second review: it was a separate marker file that a compact
+    never cleared, so a compacted helper was never told at 85% again), so it starts fresh by the state's own rules:
+    a compact, or a drop under the stop's 80% band. main() calls this only when the note is due and not held (under
+    the guide it is held when the 85% guard heads-up, which names the stop, came first: one note, not two alike)."""
+    if load_state(state).get("soft") is True:   # given already: one read, no lock
         return None
-    mark = os.path.join(C.state_dir(), f"bigdad-soft-{sid}-{agent}")
-    if os.path.exists(mark):
-        return None
-    try:
-        open(mark, "w").close()
-    except OSError:
-        return None
+    with C.lock(state):
+        st = load_state(state)
+        if st.get("soft") is True:
+            return None
+        st["soft"] = True
+        save_state(state, st)
     return (f"🥛 Big Dad 🟡 ~{tokens // 1000:,}k of this agent's {C.stop_label(cap)} per call: finish this step, get the "
             f"handoff ready ({C.handoff_path(C.dstr(event.get('agent_type')), agent)}: {HANDOFF}).")
 
@@ -322,14 +331,24 @@ def main(event=None, standalone=True):
     quiet = bool(agent) and C.off("BIGDAD_AGENT_GUARD")   # 3.0.0: no helper notes; the main-chat note stays
     if agent:
         limit = C.agent_guide(path, limit)   # 3.0.0: a helper's guide follows its own window (1M: 650k, not 130k)
+    # a helper's one note comes at 85% of its guide, so its finish-and-report lands under the guide; the main chat's at it
+    warn_at = C.HEADSUP_AT * limit if agent else limit
     own = None                         # this thread's own warning, if due
+    early = False                      # this helper was told before reaching its guide (a heads-up), on an earlier call
+    row_only = 0                       # past the guide after that heads-up: write the over-guard row, say nothing
     receipt = None
+    # agent-stop on: the stop's 80% note. Its band is arithmetic (no file looked at); whether it was given is the
+    # guard state's "soft" latch, read only where the state is read anyway (one store, one set of reset rules)
+    cap = C.stop_cap() if agent and tokens else 0
+    in_band = bool(cap) and C.SOFT_AT * cap <= tokens < cap
+    soft_given = False                 # latched on an earlier call, since the last start-fresh
     learn = C.learning()               # learning first (2.0.6): calls past the guide counted, no note, no latch
-    if tokens < limit:
-        st = load_state(state) if tokens and os.path.exists(state) else {}
+    if tokens < warn_at:
+        there = os.path.exists(state)
+        st = load_state(state) if tokens and there else {}
         if st.get("pre") and tokens == st.get("peak"):
             pass                       # this hook ran before the compact landed: same size is not a verdict yet
-        elif tokens and os.path.exists(state):   # back under the limit (after /compact): receipt, then start fresh
+        elif tokens and there:         # back under the limit (after /compact): receipt, then start fresh
             # thirty-first review: an infinite peak (1e309 in the file) raised OverflowError at int(peak); thirty-second:
             # a damaged peak (a str, NaN, 10**400) falls back to a usable warned_at, so the receipt is not lost
             peak = C.sane(st.get("peak")) or C.sane(st.get("warned_at"))
@@ -337,17 +356,28 @@ def main(event=None, standalone=True):
                 receipt = (int(peak), tokens)
                 C.append_jsonl(os.path.join(C.bd_dir(), "receipts.jsonl"), {
                     "ts": C.now(), "session": sid[:8], "before": int(peak), "after": tokens, "saved_per_call": int(peak) - tokens})
-            try:
-                os.remove(state)
-            except OSError:
-                pass
-        elif not tokens and os.path.exists(state):   # 0 = a compact since the last call (bd_common.last_call): the
-            with C.lock(state):                         # old warning's 1.5x latch is about a size that is gone; keep
-                st = load_state(state)                  # the peak for the compact receipt (Grok review, round 4)
-                if st.pop("warned_at", None) is not None:
+            soft_given = in_band and st.get("soft") is True
+            if soft_given:             # still in the stop's 80% band (a cap under the guide): only that latch stays
+                if set(st) != {"soft"}:
+                    with C.lock(state):
+                        save_state(state, {"soft": True})
+            else:
+                try:
+                    os.remove(state)
+                except OSError:
+                    pass
+        elif not tokens and there:     # 0 = a compact since the last call (bd_common.last_call): the old warning's
+            with C.lock(state):        # 1.5x latch and the stop's 80% latch are about a size that is gone; keep the
+                st = load_state(state) # peak for the compact receipt (Grok review, round 4)
+                changed = False
+                for key in ("warned_at", "over_row", "headsup", "soft"):
+                    if key in st:
+                        del st[key]
+                        changed = True
+                if changed:
                     save_state(state, st)
     elif learn:
-        if hook == "PostToolUse":
+        if hook == "PostToolUse" and tokens >= limit:   # a helper's heads-up band (85-100%) is not past the guide
             C.learn_seen("over_guide")
     elif quiet:
         pass                           # BIGDAD_AGENT_GUARD=off: no helper note and no latch
@@ -358,27 +388,56 @@ def main(event=None, standalone=True):
             # huge one silenced the guard for the whole chat, so anything C.sane refuses reads as 0
             warned = C.sane(st.get("warned_at"))
             peak = max(tokens, C.sane(st.get("peak")))
+            early = bool(agent and warned and st.get("headsup"))
+            fresh = bool(agent and warned and not early and tokens < limit)
+            if fresh:                  # told at or past its guide, now back under it: start fresh, as in 3.0.0, so
+                warned = 0             # the heads-up below tells it again (on this call when it is in the 85% band)
+                st.pop("warned_at", None)
+                st.pop("over_row", None)
+            soft_given = st.get("soft") is True
+            dropped = soft_given and bool(cap) and tokens < C.SOFT_AT * cap
+            if dropped:                # under the stop's 80% band again: that latch starts fresh too
+                del st["soft"]
+                soft_given = False
             if not (warned and tokens < warned * 1.5):
-                st["warned_at"] = tokens
-                own = tokens
-            if peak != st.get("peak") or own:
+                if agent and tokens < limit:
+                    # ONE rule for the pre-guide note: the stop's 80% note, if given before or due now, is the one;
+                    # else the heads-up. It latches as a note at the guide would (warned_at = the guide, so the next
+                    # note is at 1.5x it: never a second one at 100%), flagged so its over-guard row comes later
+                    if not (soft_given or in_band):
+                        st["warned_at"], st["headsup"] = limit, True
+                        own = tokens
+                else:
+                    st["warned_at"] = tokens
+                    st.pop("headsup", None)
+                    own = tokens
+            elif early and tokens >= limit and not st.get("over_row"):
+                # told at 85%, now past the guide: one over-guard row for `bigdad.py agents`, no second note
+                st["over_row"] = row_only = tokens
+            if peak != st.get("peak") or own or row_only or fresh or dropped:
                 st["peak"] = peak
                 save_state(state, st)
     k = f"{(own or 0) // 1000:,}k"
     if agent:
-        cap = C.stop_cap() if tokens else 0
-        soft = soft_note(sid, agent, event, tokens, cap) if cap else None
-        if own is not None and cap and tokens >= cap:
-            own = None                 # past the cap the hard stop's deny reason says it (with the handoff path)
+        def agent_row(name):           # one row for the parent's record (`bigdad.py agents`)
+            C.append_jsonl(os.path.join(C.bd_dir(), "agents.jsonl"), {
+                "ts": C.now(), "event": name, "session": sid[:8], "agent_id": agent[:17],
+                "agent_type": C.dstr(event.get("agent_type")), "tokens": tokens, "guard_at": limit})
+        # the same one rule: under the guide, after the heads-up came first, the stop's 80% note is held (not latched),
+        # so it still comes once, at the first call at or past the guide, before the cap
+        held = early and tokens < limit
         # learning first (2.0.6): the soft heads-up stays. It exists only with the hard stop on (the user's own opt-in,
         # which acts while learning), and `agent-stop` promises it; holding it cut agents off with no warning.
+        soft = soft_note(state, agent, event, tokens, cap) if in_band and not (soft_given or held) else None
+        if own is not None and cap and tokens >= cap:
+            own = None                 # past the cap the hard stop's deny reason says it (with the handoff path)
+        if own is None and row_only:   # the parent's record still says this agent passed its guide; the agent already knows
+            agent_row("over-guard")
         if own is None:                # said once; again only when the load grows another 50% (1.5x -> 2.25x -> 3.4x).
             #                            v1.4 said "stop now" on every call past 1.5x: four identical notes at 26x..31x
             #                            changed nothing and each one grew the context it complained about.
             return C.emit({"hookSpecificOutput": {"hookEventName": hook, "additionalContext": soft}}, standalone) if soft else None
-        C.append_jsonl(os.path.join(C.bd_dir(), "agents.jsonl"), {
-            "ts": C.now(), "event": "over-guard", "session": sid[:8], "agent_id": agent[:17],
-            "agent_type": C.dstr(event.get("agent_type")), "tokens": tokens, "guard_at": limit})
+        agent_row("over-guard" if tokens >= limit else "heads-up")
         # with the hard stop on, the handoff goes to a named file the relaunch line points at; with it off (the default)
         # there is no file and no relaunch line, so the report itself is the handoff (bench round 4: a file with
         # nowhere to go was ignored, then explained in the report and again in the parent's answer)
@@ -387,7 +446,17 @@ def main(event=None, standalone=True):
                     f"({HANDOFF}) and report back")
         else:
             hand = f"report back with {HANDOFF} (that report is the handoff)"
-        if not cap:                    # 3.0.0: the stop is off (the default): the fact and a suggestion, no order;
+        if tokens < limit:             # the heads-up at 85% of the guide: the one routine note, early enough to finish
+            #                            and report under the guide (measured: 5 and 14+ calls of wrap-up after a note)
+            head = (f"🥛 Big Dad 🟡 heads-up: this agent re-sends ~{tokens // 1000:,}k tokens per call, "
+                    f"{int(100 * tokens / limit)}% of its {limit // 1000}k cost guide")
+            if cap:
+                text = (f"{head}; the hard stop is at its {C.stop_label(cap)}. Finish the current step, then {hand} "
+                        "before it reaches the guide, so the parent can relaunch you fresh.")
+            else:
+                text = (f"{head} (a cost guide, not a limit). If the work allows, finish the current step and {hand} "
+                        "before it reaches the guide, so the parent can relaunch you fresh.")
+        elif not cap:                  # 3.0.0: the stop is off (the default): the fact and a suggestion, no order;
             #                            the work is the user's (principles check, gap 2)
             dot, size = ("🔴", f"{tokens / limit:.1f}x the") if tokens >= 1.5 * limit else ("🟡", "over the")
             text = (f"🥛 Big Dad {dot} guard: this agent re-sends ~{tokens // 1000:,}k tokens per call, {size} "

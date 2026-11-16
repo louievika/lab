@@ -188,9 +188,9 @@ def main(event=None, standalone=True):
         sys.path.insert(0, SCRIPTS)
         import bd_baseline as B
         b = B.load()
-        learn = not C.off("BIGDAD_REFRESH") and not C.off("BIGDAD_LEARN")
+        import bd_learn
+        learn = bd_learn.can_begin(source)   # the same gates `proof read` reads (bd_learn.would_begin)
         if learn:
-            import bd_learn
             bd_learn.begin(b)          # decided once; a baseline from before 2.0.6 means it never starts
         sync = os.environ.get("BIGDAD_BASELINE_SYNC") == "1"
         if C.off("BIGDAD_REFRESH"):

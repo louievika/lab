@@ -229,8 +229,9 @@ def cmd_report(args):
     sp = startup_parts(agent) if agent.present() else None
     if sp:
         total, parts, _ = sp
-        parts_html = (f"<p class='sub'>newest measured first call: {total:,} tokens. Shares below are by size (≈ 4 chars per token).</p>"
-                      + svg_bars([(k, v // 4) for k, v in parts.items()], unit="≈tokens"))
+        parts_html = (f"<p class='sub'>newest measured first call: {total:,} tokens (measured: API counts in the log). Shares below are by size,"
+                      " estimated (chars, 4 per token).</p>"
+                      + svg_bars([(k, v // 4) for k, v in parts.items()], unit="tokens (estimated)"))
     # agents
     ar = agent_rows(hours)
     arows, aflags = (ar if ar else ([], []))
@@ -251,7 +252,7 @@ def cmd_report(args):
     page = f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Big Dad report</title><style>{CSS}</style></head><body><main>
 <h1>Big Dad report</h1>
-<p class='sub'>{esc(time.strftime('%Y-%m-%d %H:%M %Z'))} · last {hours:g} h · surfaces seen (7 days): {esc(surfaces)} · all numbers from Claude Code's own logs (verified: API usage) unless marked ≈</p>
+<p class='sub'>{esc(time.strftime('%Y-%m-%d %H:%M %Z'))} · last {hours:g} h · surfaces seen (7 days): {esc(surfaces)} · all numbers measured (API counts in Claude Code's own logs) unless marked estimated</p>
 <h2>Tokens per call over time</h2><div class='card'>{svg_scatter(pts)}<p class='muted'>Every call re-sends the whole context. A staircase means the session kept growing; a drop is a /compact or a fresh session. Guard at {guard // 1000}k.</p></div>
 <h2>Startup load by source</h2><div class='card'>{parts_html}</div>
 <h2>Models × modes</h2><div class='card'>{table(["model", "mode", "calls", "input tokens", "output", "input/call", "share"],

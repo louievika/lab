@@ -6,7 +6,8 @@ floor. Settled areas are skipped in audits and only re-checked by the drift chec
 runs every DRIFT_DAYS instead of every 7. A settled area that grows back past its floor is un-settled and the user
 gets one line at the next session start (a systemMessage: 0 tokens for Claude). A lower reading moves the floor down.
 
-  bigdad.py settle            one line per area: settled (floor, since), moving, or built back up
+  bigdad.py settle            one line per area: settled (floor, since), moving, or built back up; under the header,
+                              when the last snapshot was taken and when the next is due (its figures are from then)
   bigdad.py settle reset      forget every floor (the next two snapshots settle again)
 """
 import json, os, sys
@@ -133,9 +134,14 @@ def lines(s):
     out.append(f"🥛 Big Dad settle · {n} of {len(AREAS)} settled · {len(s['history'])} snapshots · {due}")
     last = s["history"][-1] if s["history"] else {}
     empty = not s["history"] and not s["settled"]
-    why = None                         # the "no data" reason: read once per run, only if an area needs it
+    why = None                         # the "no data" reason: read once per run, only if a line needs it
     if empty:
         out.append(f"  no data   all {len(AREAS)} areas: {_next_snapshot(s)}")
+    elif isinstance(last, dict) and last:   # 3.0.1 (outside tester): the figures are the last snapshot's, not today's
+        why = _next_snapshot(s)
+        when = C.shown(last.get("ts"))[:10] or "?"
+        out.append(f"  snapshot  last taken {when}; the figures here are from then (`baseline` adds newer chats "
+                   f"between full builds); {why}")
     for k, (label, _, _) in ([] if empty else AREAS.items()):
         st = s["settled"].get(k)
         if st:

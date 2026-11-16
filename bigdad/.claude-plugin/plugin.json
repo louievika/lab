@@ -1,7 +1,7 @@
 {
   "name": "bigdad",
   "displayName": "Big Dad",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Big Dad brings home the milk: shows where your Claude Code tokens go and keeps the dead weight out (repeat reads, long outputs, unused tools), with a receipt for every cut.",
   "author": {
     "name": "LouieVika"

@@ -1,6 +1,6 @@
 # 🥛 Big Dad
 
-The token watchdog for Claude Code. Plugin version 3.0.0.
+The token watchdog for Claude Code. Plugin version 3.0.1.
 
 Every time you hit enter, Claude Code sends the whole conversation again. Big Dad watches every call and every helper agent, blocks the repeat read, trims noisy output and slims the compact. It changes no setting without your yes.
 

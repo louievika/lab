@@ -6,7 +6,7 @@
 
 <p align="center">
   The token watchdog for Claude Code<br>
-  Plugin version 3.0.0 · MIT · Windows, macOS, Linux
+  Plugin version 3.0.1 · MIT · Windows, macOS, Linux
 </p>
 
 ## Watch the ad
@@ -60,6 +60,15 @@ Needs Python 3 (3.9 or newer). Update: `claude plugin update bigdad@lab`. Remove
 
 Type `receipt` in any chat for that chat's receipt, read from its own log. It costs 0 tokens: the prompt never reaches the model.
 
+## New in 3.0.1
+
+- **Grep output cap.** A Grep result over 4,000 characters now keeps its start and its end, like a long command output. The full result is saved to a file. Turn it off with `BIGDAD_GREP_SHRINK=off`.
+- **Earlier heads-up for helper agents.** A helper is told once at 85% of its guide instead of at the guide, so it can finish its step and report back.
+- **Lean skill page.** The page Big Dad loads into a chat went from 4,532 to 1,431 bytes. The longer rules moved to a reference file.
+- **Honest self-count.** `self` splits everyday work from building and testing Big Dad, labels every figure as measured or estimated, and takes read-backs of a saved output off the saving.
+- **Proof that measures the guard.** `proof read` now measures the read guard whatever the install's learning state, and says so while the install is still learning.
+- **Dated figures.** `settle` says when its startup figures were taken.
+
 ## New in 3.0.0
 
 - **Short receipt.** `receipt` now prints 44 columns and at most 18 lines, in plain red, yellow and green. `receipt full` prints every line.
@@ -68,9 +77,23 @@ Type `receipt` in any chat for that chat's receipt, read from its own log. It co
 - **Fits your setup.** Reports and setup never run your hooks. Company-managed settings are respected and never get a proposed cut. JSON output is never cut.
 - **Security and correctness.** The fixes from an outside review of 2.0.9: safer checks on Big Dad's state folder, Windows permission fixes, and atomic saves.
 
-3.0.0 has not been benched for cost yet. The results below were measured on the versions named.
+The results below were measured on the versions named.
 
 ## Measured results
+
+Sonnet, 3.0.1 (the tagged release) against stock Claude Code. Seven scripted scenarios, two rounds, 16 Nov 2026, Windows, one PC. Tokens only.
+
+On the five scenarios where Big Dad acts: 696.4k tokens without, 571.1k with. That is 125.3k fewer, -18.0%.
+
+| Scenario | Tokens with Big Dad |
+|---|---|
+| Same file read 3 times | -42.5% |
+| Noisy command output | -29.2% |
+| `cat` of a file already read | -5.0% |
+| Compacted chat | +0.3% |
+| Helper agent | +0.9% |
+
+Medians over the 9 passed runs a side from both rounds. The first round was not clean: the usage limit was hit in its fifth repeat. The second round was clean, 5 of 5 in every scenario on both sides. Each round alone gives the same figure (-17.96% and -17.99%). In the other two scenarios Big Dad takes no action, and at the same number of model calls the two sides are level (0.1% under to 0.5% over).
 
 Opus, 2.0.9, one helper agent and one file read three times, with and without Big Dad. Same prompts, same model.
 
@@ -122,7 +145,8 @@ Early head-to-head runs, 8 Nov 2026 (Big Dad development builds from 8 Nov 2026,
 - **Big Dad's own cost, 6-10 Nov 2026:** counting the chats that built and tested Big Dad, it cost 1,562,688 tokens and saved 1,184,194: net -378,494 tokens. Building and testing alone: net -871,400. Everyday use alone: cost 84,144, saved 577,050. Big Dad's own count, versions 1.0 to 2.0.3.
 - No saving is claimed for helper agents. Compacts: see the live-use count above; in the 7-case bench the compact case showed no measurable change (the run ranges overlap).
 - **A fresh install** spends its first sessions learning and used 37% more tokens in one test.
-- Limits of the benches: scripted cases, not real work; one Windows PC; the 2.0.7 bench is Haiku and Sonnet only, the 2.0.9 bench Opus only, with one helper agent, not a fleet. 3.0.0 has no cost bench and no real-world run on a second machine yet.
+- **3.0.1 bench:** the compacted chat used 0.3% more tokens with Big Dad and the helper agent 0.9% more.
+- Limits of the benches: scripted cases, not real work; one Windows PC; the 2.0.7 bench is Haiku and Sonnet only, the 2.0.9 bench Opus only, the 3.0.1 bench Sonnet only, with one helper agent, not a fleet. There is no real-world run on a second machine yet.
 
 ## Check the numbers yourself
 
@@ -136,13 +160,13 @@ Early head-to-head runs, 8 Nov 2026 (Big Dad development builds from 8 Nov 2026,
 
   (from a clone of this repo; it spends a little of your own usage).
 
-<!-- GATES-3.0.0 -->
-Unit tests: 1,617 pass, 0 failures (43 skipped on Windows, 17 on Linux). Break test: 1,251 runs, 0 failures. Fuzz test: 5,296 runs, 0 failures. 3.0.0, 15 Nov 2026, in a Linux sandbox and natively on Windows 11 (one PC). Not run on macOS.
-<!-- /GATES-3.0.0 -->
+<!-- GATES-3.0.1 -->
+Unit tests: 1,742 pass, 0 failures (43 skipped on Windows, 17 on Linux). Break test: 1,251 runs, 0 failures. Fuzz test: 5,296 runs, 0 failures. 3.0.1, 16 Nov 2026, natively on Windows 11 and on Arch Linux under WSL2 (one PC). Not run on macOS.
+<!-- /GATES-3.0.1 -->
 
 ## Version and licence
 
-Big Dad 3.0.0 · MIT · by LouieVika
+Big Dad 3.0.1 · MIT · by LouieVika
 
 <p align="center">
   <img src="assets/06-end-card.jpg" width="80%" alt="End card: Big Dad's home. Big Dad for Claude Code. github.com/louievika/lab">

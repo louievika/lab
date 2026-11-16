@@ -883,6 +883,11 @@ def calls_and_size(path, cap=FLOOR_LOG_CAP):
 
 
 SOFT_AT = 0.8                           # the heads-up before the hard stop, as a share of the cap
+# A helper's one guard note comes at 85% of its own guide, not at the guide. Measured on two helpers told at the
+# guide: 5 and 14+ more calls after the note (peaks 133.6k and 147.5k), so the finish-and-report landed above it. At
+# ~1.7k-2.8k growth per call, 85% (110.5k of 130k) leaves 19.5k for the wrap-up. Helpers only; the main chat's note
+# stays at its guide.
+HEADSUP_AT = 0.85
 
 
 def short_id(agent):
@@ -1178,8 +1183,18 @@ def learn_seen(kind):
     append_jsonl(os.path.join(bd_dir(), "learn-seen.jsonl"), {"k": kind})
 
 
+def own_run():
+    """True in a session Big Dad itself starts headless and nobody sees: BIGDAD_PROBE=1, set by `proof read`,
+    `probe` and `setup --measure` only (never a user switch)."""
+    return os.environ.get("BIGDAD_PROBE") == "1"
+
+
 def learned_note():
-    """The one line saying learning is over, once: whoever removes bd_dir()/learned first shows it."""
+    """The one line saying learning is over, once: whoever removes bd_dir()/learned first shows it. Never in Big
+    Dad's own headless runs (own_run(): `proof read`, `probe`, `setup --measure`): a session nobody sees leaves it
+    on disk. BIGDAD_GUARD=off (the user's switch) does not hold it: the tool-call hook shows it, as in 3.0.0."""
+    if own_run():
+        return None
     p = os.path.join(bd_dir(), "learned")
     try:
         with open(p, encoding="utf-8", errors="replace") as f:

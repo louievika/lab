@@ -4,6 +4,9 @@ Two tiny headless runs in a temp folder read the same ~12.6k-char file twice. Ru
 read guard off, run B on. For each run the measured number is the growth in input tokens
 between the call that asked for the second read and the call after it: that is what the
 second read added to every later call. Headless only; cleans up after itself.
+Both runs set BIGDAD_LEARN=off, so the guard itself is measured even on an install still in its learning period
+(where everyday sessions only count second reads); a line says so when this install is learning, or will start
+learning at its next normal session start (a new install the proof ran on first).
 """
 import json, os, shutil, subprocess, sys, tempfile
 
@@ -80,6 +83,26 @@ def run_once(cmd, cwd, env):
     return deltas(out.stdout.splitlines())
 
 
+def learning_note():
+    """One line when this install is in its learning period (the hooks' test, bd_common.learning) or its next normal
+    session start would begin one (bd_learn.would_begin), else None. Reads only."""
+    try:
+        if C is None:
+            return None
+        import bd_learn
+        if C.learning():
+            return (f"  This install is learning: measured here with learning set aside (BIGDAD_LEARN=off); in "
+                    f"everyday sessions the guard only counts second reads until the baseline covers "
+                    f"{bd_learn.min_calls()} calls.")
+        if bd_learn.would_begin():
+            return (f"  Learning has not started on this install yet: measured here with learning set aside "
+                    f"(BIGDAD_LEARN=off); everyday sessions will first only count second reads until the baseline "
+                    f"covers {bd_learn.min_calls()} calls.")
+    except Exception:
+        pass
+    return None
+
+
 def cmd_proof_read(args):
     exe = shutil.which("claude")
     if not exe:
@@ -92,7 +115,9 @@ def cmd_proof_read(args):
         f.write(sample_text())
     cmd = [exe, "-p", PROMPT.format(f=fp.replace("\\", "/")), "--model", model, "--strict-mcp-config",
            "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--allowedTools", "Read"]
-    base = dict(os.environ, BIGDAD_GUARD="off", BIGDAD_WATCH="off")
+    note = learning_note()            # this install's state, as found before the runs
+    base = dict(os.environ, BIGDAD_GUARD="off", BIGDAD_WATCH="off", BIGDAD_LEARN="off",   # the guard itself;
+                BIGDAD_PROBE="1")                 # Big Dad's own run: it takes no learned line
     try:
         a = run_once(cmd, d, dict(base, BIGDAD_READ_GUARD="off"))
         b = run_once(cmd, d, dict(base, BIGDAD_READ_GUARD="on"))
@@ -106,4 +131,6 @@ def cmd_proof_read(args):
             print(f"  {name}: 2nd read added {delta:,} tokens to every later call  (calls {len(calls)}, reads {len(reads)})")
     if a[2] and b[2] is not None:
         print(f"  guard saves {a[2] - b[2]:,} tokens per call after a repeated read ({(a[2] - b[2]) / a[2]:.0%}).")
+    if note:
+        print(note)
     print("  Headless only: interactive sessions and agents run the same hook, so the saving carries over, but is not measured here.")

@@ -34,9 +34,15 @@ permission rules see and has broken exit codes and Windows quoting for them. Big
     So is output already cut by a final `| tail -N` / `| head -N` (N up to 200): the caller chose that cut.
     2.0.9: only when that pipeline is all that prints (cd/export aside) and the real output agrees: no more
     lines than N, normal-width lines (400 chars on average, none over 4,000). Else the cap applies.
+  - Grep cap (3.0.1): a content-mode Grep tool result over 4,000 chars gets the same cap, note and saved copy
+    (its `content` field cut, the rest of the result as Grep gave it). Left whole: files-with-matches and count
+    modes (short lists), a result over 20,000 chars (Claude Code saves it and shows a 2KB preview on its own),
+    and a result the model limited itself with an explicit `head_limit` of up to 200 lines, as a final `| head -N`
+    is for Bash (with the trim's normal-width check). Grep's default limit (250 lines) is not an explicit cut.
   - Any internal error: no output, so Claude sees the original.
 
   BIGDAD_SHRINK=off          turn it off (or `bigdad.py shrink off`, which writes ~/.claude/bigdad/shrink)
+  BIGDAD_GREP_SHRINK=off     the Grep cap only (Bash/PowerShell as before)
 """
 import errno, json, os, re, stat, sys, time, zlib
 
@@ -56,6 +62,7 @@ LINE_CAP = 400             # characters kept of one line
 IMPORTANT_CAP = 250        # error/warning lines kept (first half + last half past this; the note counts the rest)
 FAIL_CAP = 400             # lines kept of the failure sections of a test run
 CAP_CHARS = 4_000          # 2.0.5: output of a command no family knows (and not a file read) is capped here
+CAP_MIN = CAP_CHARS + 4 * MIN_SAVE_TOKENS + 200   # the least the Bash and Grep caps cut: + the net win and the note
 CAP_TAIL = 900             # ...of which the end; the note follows the start, so the receipts (last 1,500 chars) see it
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
@@ -987,6 +994,56 @@ def note(kept, total, before, after, path, fams=(), omitted=0, what=None):
 NOTE_RE = re.compile(r"Big Dad shrink: showed ([\d,]+) of ([\d,]+) lines \(~([\d,]+) → ~([\d,]+) tokens")
 
 
+NOTE_LINE_RE = re.compile(r"^\[🥛 " + NOTE_RE.pattern + r"\): [^\n]*\]\r?$", re.M)
+
+
+def already_shrunk(text, whole_line=False):
+    """A real shrink note in note()'s exact shape (3.0.0: not a quote of the mark earlier on, as in a diff of the
+    docs; agent check gap 5). Shared by the Bash shrink and the Grep cap. 3.0.1, second review: the bare mark in the
+    last 1,500 chars no longer counts (a Grep or `grep -rn` of this repo, or any output ending in a mention of the
+    mark, was left whole). Bash: the full note anywhere still counts (a diff of a cut output is not cut again,
+    test_v300_shrink). Grep (whole_line): only the note as a line of its own, since a match line quoting it carries
+    its path or line-number prefix."""
+    return bool((NOTE_LINE_RE if whole_line else NOTE_RE).search(text))
+
+
+def grep_limit(n):
+    """Grep's head_limit as a line count, or 0 when it is not one: an int, an integral float (150.0) or a digit
+    string ("150"); never a bool, a fraction, NaN or infinity, or other text. Never raises (3.0.1, second review)."""
+    if isinstance(n, bool):
+        return 0
+    if isinstance(n, int):
+        return n
+    if isinstance(n, float):
+        return int(n) if n.is_integer() else 0
+    if isinstance(n, str) and re.fullmatch(r"[0-9]{1,12}", n.strip()):
+        return int(n.strip())
+    return 0
+
+
+def own_out(path, cwd=""):
+    """True when a Grep's path is inside Big Dad's own saved-output folder (out_dir(), or the temp-folder one 2.0.8
+    and earlier used): the shrink note says "Grep it", and capping that Grep saved another copy, so the model never
+    saw the middle (3.0.1, second review). No path: Grep searches the cwd."""
+    path = path if isinstance(path, str) and path else cwd if isinstance(cwd, str) else ""
+    if not path:
+        return False
+    try:
+        p = os.path.normcase(os.path.realpath(os.path.join(cwd if isinstance(cwd, str) else "", path)))
+        mine = out_dir()
+        dirs = [mine]
+        legacy = C.legacy_state_dir()
+        if legacy:
+            dirs.append(os.path.join(legacy, os.path.basename(mine)))
+        for d in dirs:
+            d = os.path.normcase(os.path.realpath(d))
+            if os.path.commonpath([p, d]) == d:
+                return True
+    except (OSError, ValueError, TypeError):
+        pass
+    return False
+
+
 def parse_note(text):
     """(before, after) tokens from a shrink note in a tool result, or None."""
     m = NOTE_RE.search(text) if isinstance(text, str) else None
@@ -999,6 +1056,8 @@ DRY_PATH = os.path.join("bigdad-out", "not-saved-while-learning.txt")   # same l
 def shrink_response(event, dry=False):
     """The updated tool output for a PostToolUse event, plus the receipt row; None to leave it whole.
     dry (learning first, 2.0.6): the same verdict with no full output saved."""
+    if event.get("tool_name") == "Grep" and event.get("hook_event_name") in (None, "PostToolUse"):
+        return grep_response(event, dry)
     if event.get("tool_name") not in SHELLS or event.get("hook_event_name") not in (None, "PostToolUse"):
         return None
     args = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
@@ -1008,9 +1067,8 @@ def shrink_response(event, dry=False):
     stdout = resp.get("stdout")
     if not isinstance(stdout, str) or not isinstance(resp.get("stderr", ""), str):
         return None
-    if MARK in stdout[-1_500:] or NOTE_RE.search(stdout) or resp.get("backgroundTaskId"):
-        return None                                   # already shrunk: the note, or the mark where the receipts read it
-        # (3.0.0: not a quote of the mark earlier on, as in a diff of the docs; agent check gap 5)
+    if already_shrunk(stdout) or resp.get("backgroundTaskId"):
+        return None
     if resp.get("persistedOutputPath"):
         return None                                   # Claude Code saved it and shows its own 2KB preview (LEDGER #9)
     fams = classify(args.get("command"))
@@ -1121,8 +1179,8 @@ def cap_response(event, args, resp, stdout, dry=False):
     (trim_fits); when it doesn't, the cap applies, to a file read too (`cat app.min.js | head -3` asked for 3
     lines, not the file; the read guard sees the note and does not mark the file as in context)."""
     cmd = args.get("command")
-    if len(stdout) < CAP_CHARS + 4 * MIN_SAVE_TOKENS + 200:
-        return None                                   # (+ the net win and the note: no copy saved just to delete it)
+    if len(stdout) < CAP_MIN:
+        return None                                   # no copy saved just to delete it
     n = trim_lines(cmd)
     if n is not None:
         if _fits(n, stdout):
@@ -1137,6 +1195,48 @@ def cap_response(event, args, resp, stdout, dry=False):
     if len(stdout) <= (limit or INLINE_CAP) and is_json(stdout):
         return None                                   # cut JSON is broken JSON; past the inline limit Claude Code
         # saves the output and shows its own preview, so the parse is skipped there (3.0.0)
+    return cap_cut(event, resp, "stdout", stdout, dry)
+
+
+# 3.0.1 Grep cap. Claude Code 2.1.325's Grep result (read from the program): {"mode": "content" | "files_with_matches"
+# | "count", "numFiles", "filenames", "content", "numLines", "totalLines", "appliedLimit", "appliedOffset",
+# "timedOut"}; in content mode the model reads `content` (plus a pagination line Claude Code adds). Grep's own
+# maxResultSizeChars is 20,000: past it Claude Code saves the result and shows a 2KB preview, smaller than the cap.
+GREP_INLINE = 20_000
+GREP_LIMIT_MAX = TRIM_MAX       # an explicit head_limit up to this many lines is the caller's own cut, as a final
+#                                 `| head -N` is for Bash (with the same normal-width check); Grep's default of 250
+#                                 is not in tool_input, so it is never read as the caller's cut
+
+
+def grep_response(event, dry=False):
+    """The Bash cap for a content-mode Grep result: `content` over CAP_CHARS keeps its start and end, the note where
+    the middle was, the full result saved. None to leave it (BIGDAD_GREP_SHRINK=off, the other modes, past
+    GREP_INLINE, an explicit head_limit the result agrees with, already shrunk, a Grep of Big Dad's own saved copy,
+    binary, too small to save)."""
+    if C.off("BIGDAD_GREP_SHRINK"):
+        return None
+    args = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    resp = event.get("tool_response")
+    if not isinstance(resp, dict) or resp.get("mode") != "content":
+        return None
+    content = resp.get("content")
+    if not isinstance(content, str) or not CAP_MIN <= len(content) <= GREP_INLINE:
+        return None
+    if already_shrunk(content, whole_line=True):
+        return None
+    n = grep_limit(args.get("head_limit"))
+    if 0 < n <= GREP_LIMIT_MAX and _fits(n, content):
+        return None
+    if own_out(args.get("path"), C.dstr(event.get("cwd"))):
+        return None                                   # a Grep of its own saved copy: the whole result, never re-cut
+    if is_binary(content):
+        return None
+    return cap_cut(event, resp, "content", content, dry)
+
+
+def cap_cut(event, resp, field, stdout, dry=False):
+    """The cap itself, once a caller has ruled the output in: resp[field] keeps its start and end, the rest of resp
+    as the tool gave it; (new response, receipt row), or None when saving fails or the cut saves too little."""
     text = stdout[:-1] if stdout.endswith("\n") else stdout
     total = text.count("\n") + 1
     before = len(stdout)
@@ -1158,7 +1258,7 @@ def cap_response(event, args, resp, stdout, dry=False):
             pass
         return None
     new = dict(resp)
-    new["stdout"] = out
+    new[field] = out
     row = {"ts": C.now(), "session": C.dstr(event.get("session_id"))[:8], "agent": C.dstr(event.get("agent_id"))[:17],
            "tool": event.get("tool_name"),
            "family": "cap", "lines": total, "kept": kept, "before": tokens(before), "after": tokens(after),
@@ -1219,7 +1319,8 @@ def cmd(rest):
     except OSError:
         pass
     state = "off" + (" (BIGDAD_SHRINK)" if C.off("BIGDAD_SHRINK") else "") if disabled() else "on"
-    print(f"Big Dad output shrink: {state}. Off: bigdad.py shrink off (or BIGDAD_SHRINK=off).")
+    print(f"Big Dad output shrink: {state}. Off: bigdad.py shrink off (or BIGDAD_SHRINK=off)." +
+          (" Grep cap: off (BIGDAD_GREP_SHRINK)." if C.off("BIGDAD_GREP_SHRINK") else ""))
     if not rows:
         print("No shrunk outputs logged yet.")
         return

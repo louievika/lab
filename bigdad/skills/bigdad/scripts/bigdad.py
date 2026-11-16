@@ -23,6 +23,8 @@ $CLAUDE_CONFIG_DIR), which record each request's shape and the token usage the A
   python bigdad.py health           security + upkeep checks on the setup (proposes, never changes)
   python bigdad.py fresh            setup snapshot + diff, changelog scan, retire-check vs native levers
   python bigdad.py proof read       the reread A/B: read guard off vs on, two tiny headless runs
+                                    (learning set aside in both; says so while this install is learning or
+                                    about to start)
   python bigdad.py setup            tune Big Dad's own knobs to this machine -> profile.json (auto when stale);
                                     runs no hook: launch cost from Claude Code's logs, else "not measured"
   python bigdad.py setup --measure  the same, and runs each of your per-tool-call hook commands once with a
@@ -688,8 +690,10 @@ def cmd_probe(agent, extra):
 
     def once(cmd):
         cmd = [shutil.which(cmd[0])] + cmd[1:]
-        out = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
-                             stdin=subprocess.DEVNULL, timeout=300)
+        out = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",   # guard off: these
+                             stdin=subprocess.DEVNULL, timeout=300,     # runs show no Big Dad line, so they take none
+                             env=dict(os.environ, BIGDAD_GUARD="off",   # (the learned line, the baseline's)
+                                      BIGDAD_PROBE="1"))                # Big Dad's own run
         try:
             return agent.probe_tokens(out.stdout)
         except Exception:

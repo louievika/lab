@@ -274,6 +274,9 @@ def cmd_agents(hours=24.0, profile=None, table=None):
             a.update(calls=r.get("calls", 0), total=r.get("input_total", 0), last=r.get("last_call", 0), model=r.get("model") or a["model"])
         elif ev == "over-guard":
             a["over"] = max(a["over"], r.get("tokens", 0))
+        elif ev == "heads-up":                   # 3.0.1: the guard told this helper at 85% of its guide
+            a["told"] = max(a.get("told", 0), r.get("tokens", 0))
+        # any other event name: read as nothing (a newer hook's row never breaks this reader)
     # agents the hooks never logged (a session that started before Big Dad's hooks loaded, or hooks off):
     # read them from their own logs in every project, so a runaway helper can't hide from the report
     for path in agent_logs():
@@ -366,6 +369,8 @@ def cmd_agents(hours=24.0, profile=None, table=None):
         state = "running" if aid in running else "stopped" if a.get("quit") else "done"
         if a.get("quit"):                        # thirty-sixth review: a limit name read from the log, printed safely
             fl.append("quit: " + C.shown(C.quit_what(a["quit"])))
+        if a.get("told") and not a["over"]:      # 3.0.1: told before its guide and never logged past it (a fact,
+            fl.append(f"told at ~{k(a['told'])} (85%)")   # not a flag to count)
         # thirty-fifth review: the model column printed safely too (it is the big-model text when they match);
         # thirty-sixth review: the type column as well
         row = {"state": state, "type": as_shown(a["type"][:20]), "model": as_shown(S.family(a["model"])) if a["model"] else "?",

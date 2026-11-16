@@ -10,7 +10,7 @@
     {
       "name": "bigdad",
       "source": "./bigdad",
-      "version": "3.0.0",
+      "version": "3.0.1",
       "description": "Big Dad brings home the milk: finds the tokens Claude Code keeps re-sending, keeps reads hot, and proves every cut."
     }
   ]
