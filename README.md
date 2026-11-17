@@ -11,14 +11,7 @@
 
 ## Watch the ad
 
-<!-- VIDEO: upload assets/bigdad-ad-github-720p.mp4 to GitHub and paste its user-attachments URL on the next line -->
-
-
-<!-- POSTER START: stand-in until the video URL is in. assets/poster.jpg is the ad's thumbnail; the poster opens assets/bigdad-ad-github-720p.mp4. Delete from here to POSTER END once the URL line above is filled in. -->
-<p align="center">
-  <a href="assets/bigdad-ad-github-720p.mp4"><img src="assets/poster.jpg" width="100%" alt="Watch the ad. Every call re-sends everything."></a>
-</p>
-<!-- POSTER END -->
+https://github.com/user-attachments/assets/06520c0b-41a7-4e26-8f80-7fa45314b799
 
 <p align="center">
   <img src="assets/preview-loop.webp" width="80%" alt="Silent loop from the ad. Same file read 3 times: on Haiku $0.0095 without Big Dad, $0.0048 with, -49.4%. On Sonnet $0.1745 to $0.0819, -53.1%. Measured on v2.0.7, 12 Nov 2026.">
